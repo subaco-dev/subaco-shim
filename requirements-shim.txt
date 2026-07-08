@@ -1,0 +1,14 @@
+# requirements-shim.txt — テンプレート同梱の固定 requirements のプレースホルダ
+#
+# この repo の基盤層（config/isolation/tokens/models/drivers.base/logging/cli）は
+# stdlib のみで動作するため実行時依存はゼロ。実行プレーンの本実装（sandbox_run.py /
+# E2B SDK 経路）が入った段階で、固定 requirements をリリース時に生成する。
+#
+# 生成手順（リリース時）:
+#   uv export --frozen --no-dev --format requirements-txt > requirements-shim.txt
+#
+# devShell の起動スクリプト（cube-shim）はこれを使って
+#   uvx --with-requirements requirements-shim.txt subaco-shim==<固定版> serve
+# の形で E2B SDK 等の推移依存を完全固定する。
+#
+# v0（未公開・version 0.0.0）ではプレースホルダのみ。実依存は空。

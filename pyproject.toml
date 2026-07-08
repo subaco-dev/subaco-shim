@@ -1,0 +1,63 @@
+# subaco-shim — E2B API 互換ローカル実行シム（cube-shim）
+# 配布名 subaco-shim / パッケージ subaco_shim /
+#          console_scripts `subaco-shim = subaco_shim.cli:main`
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "subaco-shim"
+version = "0.0.0"                 # 初期版は 0.0.0（未公開）
+description = "E2B API 互換ローカル実行シム（cube-shim）。OCI 汎用アダプタ（podman / Apple Container / wslc）"
+readme = "README.md"
+requires-python = ">=3.11"        # Python 3.11
+license = "Apache-2.0"            # 3 リポジトリ共通 Apache-2.0
+authors = [{ name = "Subaco contributors" }]
+keywords = ["e2b", "sandbox", "oci", "podman", "agent"]
+
+# v0 の基盤層（config/isolation/tokens/models/drivers.base/logging/cli）は
+# stdlib のみで動作するため実行時依存はゼロ。HTTP はまず stdlib http.server で実装する。
+dependencies = []
+
+[project.scripts]
+# `subaco-shim serve` でローカル HTTP シムを起動する。
+subaco-shim = "subaco_shim.cli:main"
+
+[project.optional-dependencies]
+# E2B SDK はテスト専用の extra（本体は SDK 非依存で動く。遅延依存方針）。
+# TODO: sandbox_run.py / SDK 互換テストで固定版を pin する。
+test = [
+  "pytest>=8",
+  "e2b-code-interpreter",
+]
+# lint/format 用。
+dev = [
+  "ruff>=0.6",
+]
+
+[project.urls]
+Homepage = "https://github.com/ponponusa/subaco"
+Repository = "https://github.com/ponponusa/subaco"
+
+[tool.hatch.build.targets.wheel]
+packages = ["subaco_shim"]
+
+# --- ruff（lint + format） ------------------------------------------
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["subaco_shim", "tests"]
+
+[tool.ruff.lint]
+# E/F(pyflakes,pycodestyle) I(isort) UP(pyupgrade) B(bugbear) SIM(simplify)
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["subaco_shim"]
+
+# --- pytest ------------------------------------------------------------------
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+# 未インストール（editable 無し）でも tests から subaco_shim を解決できるように。
+pythonpath = ["."]

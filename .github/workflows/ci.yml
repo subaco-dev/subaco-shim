@@ -1,0 +1,75 @@
+# subaco-shim CI（just 規約 test / lint / fmt に対応）
+#
+# 方針:
+# - lint（ruff check + format --check）と test（pytest / mock ドライバ）を
+#   ubuntu + macos マトリクスで実行する。基盤層は stdlib のみで動くため外部依存ゼロで green。
+# - podman の実コンテナ統合は **nightly**（schedule）で ubuntu のみ実行する。実バイナリ検出に
+#   依存するテストは `shutil.which("podman")` ガードで skip されるため、通常の PR/push では走らない。
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # 毎日 04:00 UTC。podman 実コンテナ統合の nightly ジョブを回す。
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: lint (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: uv をセットアップ（Python 3.11）
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.11"
+      - name: ruff check
+        run: uv run --with ruff ruff check .
+      - name: ruff format --check（非破壊の整形チェック）
+        run: uv run --with ruff ruff format --check .
+
+  test:
+    name: test (${{ matrix.os }})
+    needs: lint
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: uv をセットアップ（Python 3.11）
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.11"
+      - name: pytest（mock ドライバ・stdlib 層は外部依存なしで green）
+        run: uv run --with pytest pytest -q
+
+  podman-integration:
+    name: podman integration (nightly)
+    # nightly（schedule）と手動実行でのみ走らせる。PR/push では skip。
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: podman を導入（ubuntu ランナーは rootless 前提が設定済み）
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y podman
+          podman --version
+      - name: uv をセットアップ（Python 3.11）
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.11"
+      - name: pytest（podman 検出時のみ実コンテナ経路も対象。未検出テストは shutil.which で skip）
+        # 実バックエンド e2e 契約は SUBACO_SHIM_LIVE_TEMPLATE を渡したときのみ走る（既定は skip）。
+        # TODO: provision 済みテンプレート参照を Secrets 経由で与え、実機統合を有効化する。
+        run: uv run --with pytest pytest -q

@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# uv / venv
+.venv/
+.uv/
+
+# テスト・ツール
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# シムのローカル状態（プロジェクト側で生成。この repo には含めない）
+.cube/
+
+# OS
+.DS_Store
