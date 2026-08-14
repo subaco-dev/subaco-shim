@@ -1,0 +1,75 @@
+# subaco-shim リリース（PyPI 公開）。
+# - トリガは semver タグ push（v0.1.0 等）。実装計画書 M2b-3(c) のリリース手順の自動化部分。
+# - 認証は PyPI の Trusted Publishing（OIDC）。API トークンを Secrets に置かない。
+#   事前に PyPI 側で pending publisher（owner/repo・workflow=release.yml・environment=pypi）を
+#   登録しておくこと（手順は RELEASING.md）。
+# - タグとパッケージ版（pyproject.toml / subaco_shim/_version.py）の一致をゲートし、
+#   公開後にテンプレート同梱用の固定 requirements（uv export）を生成して添付する。
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build + version gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: バージョン一致ゲート（タグ = pyproject = _version.py）
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          proj="$(uv run --no-project python -c 'import tomllib;print(tomllib.load(open("pyproject.toml","rb"))["project"]["version"])')"
+          mod="$(uv run --no-project python -c 'import re;print(re.search(r"\"([^\"]+)\"", open("subaco_shim/_version.py").read()).group(1))')"
+          echo "tag=$tag pyproject=$proj _version=$mod"
+          [ "$tag" = "$proj" ] && [ "$tag" = "$mod" ] || { echo "::error::タグとパッケージ版が一致しません"; exit 1; }
+
+      - name: テスト（stdlib 層・mock ドライバ）
+        run: |
+          uv run --python 3.11 --with pytest --no-project pytest -q
+
+      - name: ビルド（sdist + wheel）
+        run: uv build
+
+      - name: 固定 requirements の生成（テンプレート同梱用）
+        # 実行時依存ゼロのため通常は空に近いが、hive 側と同型の手順で生成・添付する
+        # （起動スクリプトは `uvx --with-requirements requirements-shim.txt subaco-shim==<版>`）。
+        run: |
+          uv export --no-dev --no-emit-project --format requirements-txt \
+            -o dist/requirements-shim.txt
+          head -5 dist/requirements-shim.txt || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    name: publish to PyPI (Trusted Publishing)
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write # OIDC（Trusted Publishing）に必須
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: requirements を配布物から除外（PyPI へは sdist/wheel のみ）
+        run: mv dist/requirements-shim.txt "$RUNNER_TEMP/"
+
+      # v1.13.0 を commit SHA でピン留め（供給網対策）。
+      - uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0

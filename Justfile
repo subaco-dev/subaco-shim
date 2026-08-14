@@ -31,3 +31,8 @@ compile:
 
 # CI 相当をローカルで再現（lint + 整形チェック + test。.github/workflows/ci.yml と対応）
 ci: lint fmt-check test
+
+# リリース用: テンプレート同梱の固定 requirements を生成（RELEASING.md「公開後」参照）。
+# プロジェクト自身は含めない（起動スクリプトが `uvx ... subaco-shim==<版>` で版を固定する）。
+export-reqs:
+    uv export --no-dev --no-emit-project --format requirements-txt -o requirements-shim.txt
