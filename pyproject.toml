@@ -47,6 +47,9 @@ packages = ["subaco_shim"]
 line-length = 100
 target-version = "py311"
 src = ["subaco_shim", "tests"]
+# spikes/ は spike の実測記録（保全物）であり production 品質の lint 対象外。
+# M2a で契約テストへ昇格させる際に tests/ へ移して lint 対象に含める。
+extend-exclude = ["spikes"]
 
 [tool.ruff.lint]
 # E/F(pyflakes,pycodestyle) I(isort) UP(pyupgrade) B(bugbear) SIM(simplify)

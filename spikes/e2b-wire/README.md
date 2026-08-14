@@ -16,4 +16,9 @@ M2a の実装時に契約テスト（実 SDK をクライアントに使う E2E�
 | `reverify_tls_envd.py` | 敵対的検証者による追試（envd 面の TLS 経由実測） |
 
 実行は `uv sync --extra test` 済みの環境で `uv run python spikes/e2b-wire/<script>`。
-TLS 証明書はスクリプトが一時生成する（鍵はコミットしない）。
+TLS 証明書（`tls_cert.pem` / `tls_key.pem`）は未収録で、`spike_rundcode_tls.py` が
+初回実行時に openssl で自動生成する（鍵はコミットしない）。`reverify_tls_envd.py` は
+同じ証明書を参照するため `spike_rundcode_tls.py` を先に一度実行しておく。
+`capture_server.py` の記録先は既定でスクリプト隣の `capture.local.jsonl`
+（環境変数 `CAPTURE_LOG` で上書き可。収録済みの `capture.jsonl` は実測時の原本）。
+本ディレクトリは ruff の対象外（pyproject の `extend-exclude`——実測記録の保全を優先）。

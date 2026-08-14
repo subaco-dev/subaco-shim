@@ -11,6 +11,7 @@
 
 import base64
 import json
+import os
 import re
 import threading
 import time
@@ -18,7 +19,12 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-LOG_PATH = "/private/tmp/claude-501/-Users-tt-git-oss-subaco-subaco/7dd16182-1485-46ab-a195-53f4824565cd/scratchpad/capture.jsonl"
+# 記録先（env で上書き可）。既定はスクリプト隣の capture.local.jsonl
+# （収録済みの実測ログ capture.jsonl を上書きしないための別名）。
+LOG_PATH = os.environ.get(
+    "CAPTURE_LOG",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "capture.local.jsonl"),
+)
 LOG_LOCK = threading.Lock()
 
 # --- 擬似サンドボックス状態（最小） ---------------------------------

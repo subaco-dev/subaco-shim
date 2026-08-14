@@ -16,6 +16,28 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 CERT = os.path.join(HERE, "tls_cert.pem")
 KEY = os.path.join(HERE, "tls_key.pem")
 
+
+def _ensure_certs():
+    """*.sbx.localhost のワイルドカード自己署名証明書を無ければ生成する（鍵はコミットしない）。"""
+    if os.path.exists(CERT) and os.path.exists(KEY):
+        return
+    import subprocess
+
+    subprocess.run(
+        [
+            "openssl", "req", "-x509", "-newkey", "ec",
+            "-pkeyopt", "ec_paramgen_curve:prime256v1",
+            "-keyout", KEY, "-out", CERT, "-days", "30", "-nodes",
+            "-subj", "/CN=*.sbx.localhost",
+            "-addext", "subjectAltName=DNS:*.sbx.localhost",
+        ],
+        check=True,
+        capture_output=True,
+    )
+
+
+_ensure_certs()
+
 os.environ["E2B_API_URL"] = "http://127.0.0.1:7799"
 os.environ["E2B_API_KEY"] = "e2b_" + "ab" * 16
 os.environ["SSL_CERT_FILE"] = CERT
