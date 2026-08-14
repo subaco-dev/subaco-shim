@@ -15,14 +15,20 @@ E2B の 2 プレーン:
 
 **v0 スコープ（5 系統）**: create/destroy・run_code・files read/write・get_info。
 
-TODO(最重要 spike): 以下は本骨子では未再現。忠実再現の可否・工数を spike で確定し、
-過大なら薄い自前クライアント（subaco SDK）へ倒す。
-  - envd（49983）の **Connect RPC / Protocol Buffers**（``spec/envd/`` の .proto）面。
-  - run_code（49999）の実トランスポート（HTTP/SSE/gRPC/WebSocket）とストリーミング挙動
-    （固定する e2b-code-interpreter バージョンで要確認）。
-  - ``sandbox_domain`` のローカル解決（ワイルドカード DNS / sslip.io / ホストベースルーティング）、
-    TLS の扱い、``X-Access-Token`` による多重化可否、secure 既定の envd トークン発行・検証方式。
-    ``E2B_SANDBOX_URL`` は envd のみ・``E2B_DEBUG=true`` は sandbox_id が消える制約も spike 対象。
+**ワイヤの実体は E2B ワイヤ spike で実測確定済み**（docs/00-memo/05_spike結果_E2B_ワイヤ.md・
+判定 full-fidelity-feasible・成果物 spikes/e2b-wire/。
+固定 e2b==2.30.0 / e2b-code-interpreter==2.8.1）:
+  - envd（49983）は素の HTTP 3 本（``GET /files``・``POST /files``〔multipart〕・
+    ``GET /health``）で足りる。**Connect RPC/protobuf 面は v0 の 5 系統では呼ばれない**
+    （拡張時も SDK は JSON codec 固定）。
+  - run_code（49999）は ``POST /execute`` の chunked HTTP/1.1・改行区切り JSON ストリーム
+    （SSE/WS ではない。空行禁止・timestamp ns 必須・終端はボディ終端）。
+  - サブドメイン解決は「create 応答 domain へのポート埋め込み（``sbx.localhost:{TLS ポート}``）＋
+    ``*.sbx.localhost`` 3 ラベルワイルドカード自己署名証明書＋ ``SSL_CERT_FILE``」の単一 TLS
+    リスナー（ALPN h2 非広告）。多重化は Host ヘッダの ``{port}-{sandbox_id}`` 等で成立。
+    ``E2B_DEBUG`` は create/kill が HTTP に出ないため不採用、制御プレーンは ``E2B_API_URL`` の平文。
+
+実装タスク（M2a——spike レポート §6 の差分作業 1〜7）で本モジュールを実配線化する。
 """
 
 from __future__ import annotations
@@ -35,11 +41,12 @@ HEADER_ACCESS_TOKEN = "X-Access-Token"  # envd データプレーン（create �
 HEADER_ISOLATION_LEVEL = "X-Isolation-Level"  # デバッグ用補助（正典は get_info の metadata）。
 
 # --- データプレーンのポート（サブドメイン形式の {port} 部） ---------
-ENVD_PORT = 49983  # envd（files / process）。Connect RPC/protobuf 面（忠実再現は spike）。
-RUN_CODE_PORT = 49999  # run_code。トランスポートは固定バージョンで要確認（spike）。
+ENVD_PORT = 49983  # envd（files / health）。v0 は素の HTTP 3 本で足りる（spike 確定）。
+RUN_CODE_PORT = 49999  # run_code（POST /execute、chunked JSON lines——spike 確定）。
 
 # create 応答が返すサブドメイン形式（{port}-{sandbox_id}.{sandbox_domain}、既定 https）。
-# TODO: sandbox_domain のローカル解決方式は spike で確定（骨子はローカル JSON API で代替）。
+# ローカル解決は「domain へのポート埋め込み + *.sbx.localhost 単一 TLS リスナー」で確定
+# （05_spike結果 §2。実配線は M2a の実装タスク）。
 SUBDOMAIN_TEMPLATE = "{port}-{sandbox_id}.{sandbox_domain}"
 
 
