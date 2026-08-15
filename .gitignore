@@ -19,5 +19,11 @@ htmlcov/
 # シムのローカル状態（プロジェクト側で生成。この repo には含めない）
 .cube/
 
+# spike のローカル生成物（スクリプトが自動生成する秘密鍵・証明書・キャプチャログ。
+# 再実行で作り直せるためコミットしない——特に tls_key.pem は秘密鍵）
+spikes/e2b-wire/tls_cert.pem
+spikes/e2b-wire/tls_key.pem
+spikes/e2b-wire/capture.local.jsonl
+
 # OS
 .DS_Store
