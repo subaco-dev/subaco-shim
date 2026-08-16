@@ -36,8 +36,8 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/ponponusa/subaco"
-Repository = "https://github.com/ponponusa/subaco"
+Homepage = "https://github.com/subaco-dev/subaco"
+Repository = "https://github.com/subaco-dev/subaco-shim"
 
 [tool.hatch.build.targets.wheel]
 packages = ["subaco_shim"]
