@@ -176,3 +176,79 @@ def test_exec_timeout_env_override(tmp_path, monkeypatch):
     assert time.monotonic() - start < 30
     assert ex2.error is None
     assert ex2.text == "done\n"
+
+
+def test_exec_orphaned_children_killed_and_not_success(tmp_path):
+    """親が正常終了しても子孫が残る場合、グループごと停止し**成功扱いにしない**。
+
+    レビュー指摘の再現: 親が sleep 30 の子（stdout 継承）を残して exit 0 すると、
+    従来は reader 待ちの後に error=None（成功）で返り、子孫はハード上限も受けずに
+    走り続けた。
+    """
+    import time
+
+    binary = _fake_podman(tmp_path, "sleep 30 &\nexit 0")
+    d = PodmanDriver(binary=binary, exec_timeout=60.0)
+    start = time.monotonic()
+    execution = d.exec("sbx1", "code")
+    elapsed = time.monotonic() - start
+    assert elapsed < 15, f"子孫の sleep 30 を待ってはならない: {elapsed:.1f}s"
+    assert execution.error is not None, "子孫が残った実行を成功扱いにしてはならない"
+    assert execution.error.name == "OrphanedProcesses"
+
+
+def test_exec_line_splitting_is_bounded(tmp_path):
+    """バイト上限通過後の行分割にも上限がある（短い行の大量分割による再膨張の防止）。
+
+    レビュー指摘の再現: 10MiB の "abcd\\n" は splitlines() で約 210 万要素・
+    最大 RSS 約 210MB に膨張した。行イベント数を上限で抑え、残りは 1 要素に集約する。
+    """
+    # 1MiB 上限で "abcd\n" を 2MiB 出力 → 蓄積は 1MiB（約 21 万行相当）。
+    binary = _fake_podman(tmp_path, "yes abcd | head -c 2097152")
+    d = PodmanDriver(binary=binary, exec_timeout=30.0, exec_max_output=1024 * 1024)
+    execution = d.exec("sbx1", "code")
+    from subaco_shim.drivers.podman import _MAX_OUTPUT_LINES
+
+    # 行イベント数は上限 + 集約された残り 1 要素以内。
+    assert len(execution.logs.stdout) <= _MAX_OUTPUT_LINES + 1
+    # データは集約要素に保持されている（総量はバイト上限のオーダー）。
+    total = sum(len(line) for line in execution.logs.stdout)
+    assert total <= 1024 * 1024
+
+
+def test_split_lines_bounded_semantics():
+    from subaco_shim.drivers.podman import _split_lines_bounded
+
+    # 上限内は splitlines() 相当（末尾改行で空要素を作らない）。
+    assert _split_lines_bounded("a\nb\n", max_lines=10) == ["a", "b"]
+    assert _split_lines_bounded("a\nb", max_lines=10) == ["a", "b"]
+    assert _split_lines_bounded("", max_lines=10) == []
+    # 上限超過は先頭 N 行 + 残り 1 要素（データは失わない）。
+    bounded = _split_lines_bounded("1\n2\n3\n4\n5\n", max_lines=2)
+    assert bounded == ["1", "2", "3\n4\n5\n"]
+
+
+def test_env_limit_values_reject_non_finite_and_fractional(tmp_path, monkeypatch):
+    """nan/inf・小数の制限値は受理せず既定値へフォールバックする。"""
+    from subaco_shim.drivers.podman import (
+        _DEFAULT_EXEC_MAX_OUTPUT,
+        _DEFAULT_EXEC_TIMEOUT,
+        resolve_exec_max_output,
+        resolve_exec_timeout,
+    )
+
+    for bad in ("nan", "inf", "-inf", "abc"):
+        monkeypatch.setenv("SUBACO_SHIM_EXEC_TIMEOUT", bad)
+        assert resolve_exec_timeout() == _DEFAULT_EXEC_TIMEOUT, bad
+    for bad in ("nan", "inf", "0.5", "abc"):
+        monkeypatch.setenv("SUBACO_SHIM_EXEC_MAX_OUTPUT", bad)
+        assert resolve_exec_max_output() == _DEFAULT_EXEC_MAX_OUTPUT, bad
+    # 正常値と無効化（0 以下）は従来どおり。
+    monkeypatch.setenv("SUBACO_SHIM_EXEC_TIMEOUT", "12")
+    assert resolve_exec_timeout() == 12.0
+    monkeypatch.setenv("SUBACO_SHIM_EXEC_TIMEOUT", "0")
+    assert resolve_exec_timeout() is None
+    monkeypatch.setenv("SUBACO_SHIM_EXEC_MAX_OUTPUT", "1024")
+    assert resolve_exec_max_output() == 1024
+    monkeypatch.setenv("SUBACO_SHIM_EXEC_MAX_OUTPUT", "0")
+    assert resolve_exec_max_output() is None

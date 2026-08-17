@@ -22,12 +22,14 @@ Linux CI（ubuntu ランナー）で検証する。このマシン（macOS・pod
 
 from __future__ import annotations
 
+import math
 import os
 import platform
 import secrets
 import shutil
 import subprocess
 import threading
+import time
 from pathlib import Path
 
 from ..isolation import IsolationLevel
@@ -56,17 +58,40 @@ _DEFAULT_EXEC_TIMEOUT = 3600.0
 # 上書き可（0 以下 = 無制限）。
 _DEFAULT_EXEC_MAX_OUTPUT = 10 * 1024 * 1024
 
+# 行イベント数の系統別上限。バイト上限を通過した出力でも、短い行の大量分割は
+# str オブジェクトのオーバーヘッドで数十倍に膨張する（10MiB の 5 バイト行 →
+# 約 210MB 実測）ため、後処理（splitlines 相当）にもメモリ境界を置く。
+# 上限を超えた残りは 1 要素に集約して保持する（データは失わない）。
+_MAX_OUTPUT_LINES = 10_000
+
 # reader スレッドの読み取り単位。
 _READ_CHUNK = 65536
 
 
 def _env_float(name: str, default: float) -> float:
+    """有限の float のみ受理する（nan/inf・解析不能は警告して既定値）。"""
     raw = os.environ.get(name)
     if raw is None:
         return default
     try:
-        return float(raw)
+        val = float(raw)
     except ValueError:
+        val = None
+    if val is None or not math.isfinite(val):
+        _log.warning("invalid_env_value name=%s value=%r using_default=%s", name, raw, default)
+        return default
+    return val
+
+
+def _env_int(name: str, default: int) -> int:
+    """整数のみ受理する（小数・nan/inf・解析不能は警告して既定値）。"""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        _log.warning("invalid_env_value name=%s value=%r using_default=%s", name, raw, default)
         return default
 
 
@@ -77,9 +102,30 @@ def resolve_exec_timeout() -> float | None:
 
 
 def resolve_exec_max_output() -> int | None:
-    """実行出力の蓄積上限を解決する（env 上書き可。0 以下は None = 無制限）。"""
-    val = _env_float("SUBACO_SHIM_EXEC_MAX_OUTPUT", _DEFAULT_EXEC_MAX_OUTPUT)
-    return None if val <= 0 else int(val)
+    """実行出力の蓄積上限を解決する（env 上書き可・整数のみ。0 以下は None = 無制限）。"""
+    val = _env_int("SUBACO_SHIM_EXEC_MAX_OUTPUT", _DEFAULT_EXEC_MAX_OUTPUT)
+    return None if val <= 0 else val
+
+
+def _split_lines_bounded(text: str, max_lines: int = _MAX_OUTPUT_LINES) -> list[str]:
+    """行分割の後処理メモリ境界: 上限を超えた残りは 1 要素に集約する。
+
+    残り全体は 1 つの str のまま保持するため（要素あたりのオーバーヘッドが掛からず）
+    メモリはバイト上限と同じオーダーに収まる。データは失わない。
+    """
+    if not text:
+        return []
+    parts = text.split("\n", max_lines)
+    if len(parts) <= max_lines:
+        # 全行が上限内。末尾改行由来の空要素を除き splitlines() 相当に整える。
+        if parts and parts[-1] == "":
+            parts.pop()
+        return parts
+    head = parts[:max_lines]
+    rest = parts[max_lines]
+    if rest:
+        head.append(rest)  # 集約された残り（改行を含む 1 要素）。
+    return head
 
 
 # 「env から解決」と「明示 None（無期限/無制限）」を区別するための番兵。
@@ -224,6 +270,7 @@ class PodmanExecutionHandle(ExecutionHandle):
         self._max_output = max_output
         self._cancelled = False
         self._timed_out = False
+        self._orphaned = False
         self._stdout_buf = bytearray()
         self._stderr_buf = bytearray()
         self._truncated = [False, False]
@@ -268,6 +315,13 @@ class PodmanExecutionHandle(ExecutionHandle):
         except (ProcessLookupError, PermissionError, OSError):
             self._proc.kill()
 
+    def _join_readers(self, timeout: float) -> bool:
+        """reader の終了（= 両 pipe の EOF）を待つ。全員終われば True。"""
+        deadline = time.monotonic() + timeout
+        for t in self._readers:
+            t.join(timeout=max(0.0, deadline - time.monotonic()))
+        return not any(t.is_alive() for t in self._readers)
+
     def _watch(self) -> None:
         """プロセス完了とハード上限を監視する（pipe とは独立の wait ベース）。"""
         try:
@@ -277,11 +331,16 @@ class PodmanExecutionHandle(ExecutionHandle):
             _log.warning("exec_timeout pid=%s timeout=%ss", self._proc.pid, self._timeout)
             self._kill_group()
             self._proc.wait()
-        # killpg 後も孫プロセスが pipe を保持する異常系に備え、reader は有限時間だけ待つ
-        # （daemon スレッドのため残っても後始末はプロセス終了時に回収される）。
-        for t in self._readers:
-            t.join(timeout=5.0)
-            if t.is_alive():
+        # 親終了後、両 pipe の EOF（= write 端の全クローズ）を待つ。EOF が来ない =
+        # 親が残した子孫プロセスが write 端を保持している。放置すると出力が欠けたまま
+        # 成功扱いになり、子孫はハード上限も受けずに走り続けるため、プロセスグループを
+        # 停止して**成功扱いにしない**（result は OrphanedProcesses エラー）。
+        if not self._join_readers(timeout=2.0):
+            self._orphaned = True
+            _log.warning("exec_orphaned_processes pid=%s — killing process group", self._proc.pid)
+            self._kill_group()
+            if not self._join_readers(timeout=5.0):
+                # killpg 後も残る異常系（daemon スレッドのため後始末はプロセス終了時）。
                 _log.error("exec_drain_stuck pid=%s", self._proc.pid)
         self._finished.set()
 
@@ -292,9 +351,11 @@ class PodmanExecutionHandle(ExecutionHandle):
         self._finished.wait()
         stdout = bytes(self._stdout_buf).decode("utf-8", "replace")
         stderr = bytes(self._stderr_buf).decode("utf-8", "replace")
+        # 行分割にも上限を置く（バイト上限通過後の splitlines() は短い行の大量出力で
+        # 数十倍に再膨張する——_split_lines_bounded 参照）。
         logs = Logs(
-            stdout=stdout.splitlines() if stdout else [],
-            stderr=stderr.splitlines() if stderr else [],
+            stdout=_split_lines_bounded(stdout),
+            stderr=_split_lines_bounded(stderr),
         )
         if any(self._truncated):
             _log.warning(
@@ -310,6 +371,16 @@ class PodmanExecutionHandle(ExecutionHandle):
             return Execution(
                 logs=logs,
                 error=ExecutionError(name="ExecTimeout", value=f"timeout={self._timeout}s"),
+            )
+        if self._orphaned:
+            # 親は正常終了したが子孫が残っていた（グループごと停止済み）。出力が欠けて
+            # いる可能性があり、ハード上限の回避経路でもあるため成功扱いにしない。
+            return Execution(
+                logs=logs,
+                error=ExecutionError(
+                    name="OrphanedProcesses",
+                    value="sandbox processes outlived the exec entrypoint and were killed",
+                ),
             )
         if self._proc.returncode != 0:
             return Execution(
