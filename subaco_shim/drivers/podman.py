@@ -33,7 +33,7 @@ from ..isolation import IsolationLevel
 from ..logging import get_logger
 from ..models import Execution, ExecutionError, Logs, Result, SandboxInfo
 from . import _commands as C
-from .base import Driver
+from .base import Driver, ExecutionHandle
 
 _log = get_logger("drivers.podman")
 
@@ -152,6 +152,61 @@ def check_rootless_prerequisites() -> list[str]:
     return problems
 
 
+class PodmanExecutionHandle(ExecutionHandle):
+    """``podman exec`` の Popen ハンドル。cancel はホスト側 exec プロセスを kill する。
+
+    クライアント TCP 切断 = 実行キャンセル（spike §1.3）の実装。exec プロセスの kill で
+    コンテナ内プロセスまで確実に止まるかはバックエンド依存のため、実コンテナでの検証は
+    podman nightly / 実機統合の対象（コンテナ自体は destroy 時に停止・削除される）。
+    """
+
+    def __init__(self, proc: subprocess.Popen[bytes], *, timeout: float) -> None:
+        self._proc = proc
+        self._timeout = timeout
+        self._cancelled = False
+
+    def done(self) -> bool:
+        return self._proc.poll() is not None
+
+    def result(self) -> Execution:
+        try:
+            stdout_b, stderr_b = self._proc.communicate(timeout=self._timeout)
+        except subprocess.TimeoutExpired:
+            self._proc.kill()
+            stdout_b, stderr_b = self._proc.communicate()
+            return Execution(
+                logs=Logs(),
+                error=ExecutionError(name="ExecTimeout", value=f"timeout={self._timeout}s"),
+            )
+        stdout = stdout_b.decode("utf-8", "replace")
+        stderr = stderr_b.decode("utf-8", "replace")
+        logs = Logs(
+            stdout=stdout.splitlines() if stdout else [],
+            stderr=stderr.splitlines() if stderr else [],
+        )
+        if self._cancelled:
+            return Execution(
+                logs=logs,
+                error=ExecutionError(name="Cancelled", value="client disconnected"),
+            )
+        if self._proc.returncode != 0:
+            return Execution(
+                results=[],
+                logs=logs,
+                error=ExecutionError(
+                    name="ExecError", value=stderr or f"rc={self._proc.returncode}"
+                ),
+            )
+        return Execution(results=[Result(text=stdout, is_main_result=True)], logs=logs)
+
+    def cancel(self) -> None:
+        if self._cancelled:
+            return
+        self._cancelled = True
+        _log.info("exec_cancelled pid=%s", self._proc.pid)
+        self._proc.kill()
+
+
 class PodmanDriver(Driver):
     """podman サブプロセスドライバ（隔離レベル = shared-kernel）。"""
 
@@ -250,25 +305,26 @@ class PodmanDriver(Driver):
         return info
 
     def exec(self, sandbox_id: str, code: str) -> Execution:
+        # ユーザコードは失敗し得るため rc 非ゼロも Execution（error 付き）として返す。
+        return self.exec_start(sandbox_id, code).result()
+
+    def exec_start(self, sandbox_id: str, code: str) -> PodmanExecutionHandle:
+        """実行を開始し、kill 可能な Popen ハンドルを返す（切断キャンセル対応）。"""
+        binary = self._binary or self._ensure_ready()
         cont = C.container_name(sandbox_id)
-        # ユーザコードは失敗し得るため check=False。返値から Execution を組み立てる。
-        proc = self._run(C.exec_code_argv(cont, code), check=False)
-        stdout = proc.stdout.decode("utf-8", "replace")
-        stderr = proc.stderr.decode("utf-8", "replace")
-        logs = Logs(
-            stdout=stdout.splitlines() if stdout else [],
-            stderr=stderr.splitlines() if stderr else [],
-        )
-        if proc.returncode != 0:
-            return Execution(
-                results=[],
-                logs=logs,
-                error=ExecutionError(name="ExecError", value=stderr or f"rc={proc.returncode}"),
+        argv = C.full_argv(binary, C.exec_code_argv(cont, code))
+        self.commands.append(argv)
+        try:
+            proc = subprocess.Popen(
+                argv,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
             )
-        return Execution(
-            results=[Result(text=stdout, is_main_result=True)],
-            logs=logs,
-        )
+        except FileNotFoundError as exc:
+            _log.error("driver_command_failed driver=podman reason=binary-not-found")
+            raise PodmanUnavailableError(str(exc)) from exc
+        return PodmanExecutionHandle(proc, timeout=self._timeout)
 
     def put_file(self, sandbox_id: str, path: str, data: bytes) -> None:
         cont = C.container_name(sandbox_id)

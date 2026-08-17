@@ -63,9 +63,15 @@ def _multipart(path: str, data: bytes) -> tuple[str, bytes]:
 
 
 def _stream_events(resp) -> list[dict]:
-    """ストリーム応答の JSON lines をイベント列へ（1 行 = 1 イベント・空行禁止の検証込み）。"""
-    assert resp.stream is not None
-    lines = b"".join(resp.stream).split(b"\n")
+    """run_code 応答の JSON lines をイベント列へ（1 行 = 1 イベント・空行禁止の検証込み）。
+
+    ディスパッチ層は未完了ハンドル（``resp.execution``）を返し、HTTP 層が完了待機して
+    ストリームへ畳む。テストではハンドルを直接完了させて同じ変換を適用する。
+    """
+    from subaco_shim.server import _execution_event_lines
+
+    assert resp.execution is not None
+    lines = b"".join(_execution_event_lines(resp.execution.result())).split(b"\n")
     assert lines[-1] == b""  # 各イベントは改行終端
     assert all(line for line in lines[:-1])  # 空行イベントは SDK クラッシュ（禁止）
     return [json.loads(line) for line in lines[:-1]]
@@ -284,6 +290,51 @@ def test_health_endpoint():
         _req("GET", "/health", headers=_data_headers(sid, wire.ENVD_PORT, access))
     )
     assert resp.status == 200
+
+
+# --- run_code のキャンセル（クライアント TCP 切断 = 実行キャンセル） ----------
+
+
+def test_run_code_disconnect_cancels_execution():
+    """実ソケットで /execute 中に切断すると driver の実行がキャンセルされること。"""
+    import socket as _socket
+    import threading
+    import time
+
+    app = _app()
+    driver = app.driver
+    created = json.loads(_create(app).body)
+    sid, access = created["sandboxID"], created["envdAccessToken"]
+
+    # gate を閉じて実行を保留させる（切断検出の時間窓を作る）。
+    driver.exec_gate = threading.Event()
+
+    server = make_server(app, host="127.0.0.1", port=0, plane="data")
+    port = server.server_address[1]
+    t = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+    t.start()
+    try:
+        body = json.dumps({"code": "slow"}).encode()
+        raw = _socket.create_connection(("127.0.0.1", port), timeout=5)
+        raw.sendall(
+            f"POST /execute HTTP/1.1\r\n"
+            f"Host: {wire.RUN_CODE_PORT}-{sid}.sbx.localhost:{port}\r\n"
+            f"{wire.HEADER_ACCESS_TOKEN}: {access}\r\n"
+            f"Content-Type: application/json\r\n"
+            f"Content-Length: {len(body)}\r\n\r\n".encode()
+            + body
+        )
+        time.sleep(0.2)  # サーバーが実行待機（切断監視）に入るのを待つ。
+        raw.close()  # クライアント切断 = 実行キャンセル。
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and sid not in driver.cancelled_execs:
+            time.sleep(0.02)
+        assert sid in driver.cancelled_execs
+    finally:
+        driver.exec_gate.set()
+        server.shutdown()
+        server.server_close()
+        t.join(timeout=5)
 
 
 # --- destroy（204/404） ------------------------------------------------------

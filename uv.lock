@@ -324,6 +324,9 @@ wheels = [
 name = "subaco-shim"
 version = "0.0.0"
 source = { editable = "." }
+dependencies = [
+    { name = "certifi" },
+]
 
 [package.optional-dependencies]
 dev = [
@@ -337,6 +340,7 @@ test = [
 
 [package.metadata]
 requires-dist = [
+    { name = "certifi" },
     { name = "e2b", marker = "extra == 'test'", specifier = "==2.30.0" },
     { name = "e2b-code-interpreter", marker = "extra == 'test'", specifier = "==2.8.1" },
     { name = "pytest", marker = "extra == 'test'", specifier = ">=8" },

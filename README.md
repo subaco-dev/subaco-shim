@@ -119,6 +119,14 @@ export E2B_API_URL="http://127.0.0.1:$(cat .cube/port)"
 export SSL_CERT_FILE="$PWD/.cube/tls/ca-bundle.pem"
 ```
 
+`.envrc` の export は direnv 評価時の**スナップショット**に過ぎない。実行時の正典は
+`scripts/sandbox_run.py` で、**実行直前に** `.cube/port` / `.cube/token` /
+`.cube/tls/ca-bundle.pem` を読み直して環境変数を更新し、シム未稼働（初回・アイドル
+終了後）なら**オンデマンド起動**して接続可能になるまで待つ（起動コマンドは
+`CUBE_SHIM_CMD` → PATH の `cube-shim` → `subaco-shim serve`。`CUBE_DIR` で `.cube` を
+明示できる）。初回起動と再起動からの回復は `tests/test_wire_contract.py` の
+オンデマンド起動 E2E が検証する。
+
 ## runbook: Linux の `*.sbx.localhost` 名前解決フォールバック
 
 データプレーン URL の解決は OS の `*.localhost` 処理に依存する。macOS と
@@ -133,6 +141,23 @@ systemd-resolved 非稼働環境では解決されない**（Ubuntu 24.04 コン
    （root 権限が必要。例: `127.0.0.1 49983-<sandbox_id>.sbx.localhost
    49999-<sandbox_id>.sbx.localhost`）。
 2. **TLS 検証**: 追加作業不要（`ca-bundle.pem` を `SSL_CERT_FILE` に指す既定構成のまま）。
+
+ワンショット実行（`sandbox_run.py`）では **post-create フック**で自動追記する:
+sandbox ID 取得後・データプレーン接続前に `CUBE_POST_CREATE_CMD` のコマンドが
+`<cmd> <sandbox_id>` として呼ばれる（非ゼロ終了は実行中断）。例:
+
+```bash
+# /usr/local/bin/cube-hosts-add（sudoers で NOPASSWD 限定を推奨）
+#!/bin/sh
+set -eu
+sid="$1"
+line="127.0.0.1 49983-${sid}.sbx.localhost 49999-${sid}.sbx.localhost"
+grep -qF "$line" /etc/hosts || echo "$line" | sudo tee -a /etc/hosts >/dev/null
+```
+
+```bash
+export CUBE_POST_CREATE_CMD=/usr/local/bin/cube-hosts-add
+```
 
 ## ドライバ差し替え
 

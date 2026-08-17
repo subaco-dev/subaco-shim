@@ -6,8 +6,11 @@ spike §2(e) の確定方式:
   ``*.localhost`` を拒否する——実測 ``CERTIFICATE_VERIFY_FAILED``）。
 - 初回生成し ``.cube/tls/`` に保存（鍵 0600）。以後は再利用し、失効が近づいたら再生成する。
 - ``SSL_CERT_FILE`` は CA バンドル全体を**置き換える**ため、SDK 側プロセスの他の HTTPS を
-  壊さないよう **certifi + シム証明書の結合バンドル**（``ca-bundle.pem``）も生成する
-  （certifi が import できない環境ではシム証明書単体をバンドルとする）。
+  壊さないよう **certifi + シム証明書の結合バンドル**（``ca-bundle.pem``）を生成する。
+  certifi は**実行時必須依存**（pyproject）であり、不在時は :class:`TlsSetupError` で
+  起動失敗させる — シム証明書単体のバンドルを黙って作ると、それを ``SSL_CERT_FILE`` に
+  設定した SDK 側プロセスの通常 HTTPS が全滅するため。certifi 更新時（パッケージ更新で
+  CA ファイルが新しくなった時）はバンドルを再生成する。
 
 証明書生成は ``openssl`` CLI に依存する（stdlib に証明書生成 API はない。Nix devShell /
 CI には openssl が入る前提。不在時は :class:`TlsSetupError` で明示エラー）。
@@ -110,17 +113,22 @@ def _generate(cert: Path, key: Path) -> None:
     key.chmod(CUBE_TOKEN_MODE)
 
 
-def _write_bundle(cert: Path, bundle: Path) -> None:
-    """certifi + シム証明書の結合バンドルを書く（certifi 不在時はシム証明書単体）。"""
-    parts: list[bytes] = []
+def _certifi_ca_path() -> Path:
+    """certifi の CA バンドルパスを返す（不在は :class:`TlsSetupError` — 必須依存）。"""
     try:
         import certifi
+    except ImportError as exc:
+        raise TlsSetupError(
+            "certifi が見つかりません。SSL_CERT_FILE 用の結合 CA バンドル生成に必須です"
+            "（シム証明書単体のバンドルは SDK 側プロセスの通常 HTTPS を壊すため、"
+            "certifi なしでは起動しません）"
+        ) from exc
+    return Path(certifi.where())
 
-        parts.append(Path(certifi.where()).read_bytes())
-    except Exception:  # certifi は任意依存（shim 本体は依存ゼロ方針）。
-        _log.info("ca_bundle_without_certifi bundle=%s", bundle)
-    parts.append(cert.read_bytes())
-    bundle.write_bytes(b"\n".join(parts))
+
+def _write_bundle(certifi_ca: Path, cert: Path, bundle: Path) -> None:
+    """certifi + シム証明書の結合バンドルを書く。"""
+    bundle.write_bytes(certifi_ca.read_bytes() + b"\n" + cert.read_bytes())
 
 
 def ensure_tls_material(paths: CubePaths) -> TlsMaterial:
@@ -128,12 +136,15 @@ def ensure_tls_material(paths: CubePaths) -> TlsMaterial:
     paths.ensure_dir()
     paths.tls_dir.mkdir(mode=0o700, exist_ok=True)
     cert, key, bundle = paths.tls_cert, paths.tls_key, paths.tls_ca_bundle
+    certifi_ca = _certifi_ca_path()
 
     if not (cert.is_file() and key.is_file()) or _cert_needs_renewal(cert):
         _generate(cert, key)
         _log.info("tls_cert_generated cert=%s days=%s", cert, _CERT_DAYS)
-    # バンドルは証明書より新しければ再利用（certifi 更新の追随は再生成時に行われる）。
-    if not bundle.is_file() or bundle.stat().st_mtime < cert.stat().st_mtime:
-        _write_bundle(cert, bundle)
-        _log.info("ca_bundle_written bundle=%s", bundle)
+    # バンドルは「シム証明書」と「certifi の CA ファイル」の両方より新しければ再利用
+    # （certifi パッケージ更新時も再生成して追随する）。
+    sources_mtime = max(cert.stat().st_mtime, certifi_ca.stat().st_mtime)
+    if not bundle.is_file() or bundle.stat().st_mtime < sources_mtime:
+        _write_bundle(certifi_ca, cert, bundle)
+        _log.info("ca_bundle_written bundle=%s certifi=%s", bundle, certifi_ca)
     return TlsMaterial(cert=cert, key=key, ca_bundle=bundle)

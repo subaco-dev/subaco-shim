@@ -156,8 +156,7 @@ def test_wrong_api_key_raises_authentication_error(live_shim, monkeypatch):
         Sandbox.create(template="tmpl-x")
 
 
-def test_sandbox_run_end_to_end(live_shim):
-    """sandbox_run.py（M2a-4）が実 SDK → シム経由で構造化出力を返すこと。"""
+def _load_sandbox_run():
     import importlib.util
     from pathlib import Path
 
@@ -165,9 +164,17 @@ def test_sandbox_run_end_to_end(live_shim):
     spec = importlib.util.spec_from_file_location("sandbox_run_e2e", script)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
+    return mod
+
+
+def test_sandbox_run_end_to_end(live_shim, monkeypatch):
+    """sandbox_run.py（M2a-4）が実 SDK → シム経由で構造化出力を返すこと。"""
+    # 稼働中の live_shim の .cube を明示（CWD 上方探索で別シムを起動させない）。
+    monkeypatch.setenv("CUBE_DIR", str(live_shim.paths.root))
+    mod = _load_sandbox_run()
 
     result = mod.run_untrusted("print('hello')", template_id="tmpl-x")
-    assert result["ok"] is True
+    assert result["ok"] is True, result
     assert result["text"] == "print('hello')"  # MockDriver はコードをそのまま返す
     assert result["isolation_level"] == "vm-per-container"
     assert result["template_id"] == "tmpl-x"
@@ -176,3 +183,115 @@ def test_sandbox_run_end_to_end(live_shim):
     import json as _json
 
     _json.dumps(result)
+
+
+def test_run_code_timeout_cancels_backend_execution(live_shim):
+    """SDK の実行タイムアウト（= クライアント切断）でバックエンド実行がキャンセルされること。
+
+    レビュー指摘の再現: 従来は driver.exec() 完了後に初めて応答を開始していたため、
+    クライアントが TimeoutException になってもバックエンドは実行を継続していた。
+    """
+    import threading
+    import time
+
+    from e2b import exceptions
+    from e2b_code_interpreter import Sandbox
+
+    driver = live_shim.driver
+    driver.exec_gate = threading.Event()  # set されるまで実行が完了しない。
+    try:
+        sbx = Sandbox.create(template="tmpl-x")
+        with pytest.raises(exceptions.TimeoutException):
+            sbx.run_code("slow", timeout=1)
+        # 切断検出でバックエンド実行がキャンセルされる（実プロセス停止の契約）。
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and sbx.sandbox_id not in driver.cancelled_execs:
+            time.sleep(0.05)
+        assert sbx.sandbox_id in driver.cancelled_execs
+    finally:
+        driver.exec_gate.set()
+        driver.exec_gate = None
+    assert sbx.kill() is True
+
+
+def test_sandbox_run_on_demand_startup_and_restart(live_shim, tmp_path, monkeypatch):
+    """初回（.cube 未初期化）とアイドル終了後（stale port）の両方から回復すること。
+
+    TLS 資材は live_shim と共有する: SDK（httpx）の SSL context はプロセス内で
+    キャッシュされるため、別証明書の新シムはこのプロセスから信頼できない。
+    実運用では証明書がプロジェクト永続なので同じ前提が成り立つ。
+    """
+    import os
+    import shlex
+    import shutil as _shutil
+    import signal
+    import socket
+    import sys
+    import time
+
+    proj = tmp_path
+    cube = proj / ".cube"
+    (cube / "tls").mkdir(parents=True)
+    for name in ("cert.pem", "key.pem", "ca-bundle.pem"):
+        _shutil.copy(live_shim.paths.tls_dir / name, cube / "tls" / name)
+    (cube / "tls" / "key.pem").chmod(0o600)
+
+    # CLI の --driver mock は既定 shared-kernel のため、サブプロセスのシムに
+    # ホスト管理者オプトイン（allow_shared_kernel）を XDG 設定で与える。
+    xdg = proj / "xdg"
+    (xdg / "subaco-shim").mkdir(parents=True)
+    (xdg / "subaco-shim" / "config.toml").write_text(
+        "allow_shared_kernel = true\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
+
+    serve_cmd = (
+        f"{shlex.quote(sys.executable)} -m subaco_shim.cli serve --driver mock "
+        f"--project-root {shlex.quote(str(proj))} --idle-timeout 60"
+    )
+    wrapper = shlex.join(["bash", "-c", f"echo $$ > {proj}/shim.pid; exec {serve_cmd}"])
+    monkeypatch.setenv("CUBE_SHIM_CMD", wrapper)
+    monkeypatch.setenv("CUBE_DIR", str(cube))
+    mod = _load_sandbox_run()
+
+    def _kill_shim() -> None:
+        os.kill(int((proj / "shim.pid").read_text()), signal.SIGTERM)
+
+    def _wait_shim_dead(port: int) -> None:
+        # プロセス存在判定（os.kill(pid, 0)）はゾンビ（親未 reap）で偽陽性になるため、
+        # listen ソケットが閉じて接続拒否になることを終了判定とする。
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                socket.create_connection(("127.0.0.1", port), timeout=0.3).close()
+            except OSError:
+                return
+            time.sleep(0.05)
+        raise AssertionError("shim did not exit")
+
+    # run_untrusted は接続 env（E2B_API_URL 等）を os.environ に直接書くため、
+    # live_shim を使う後続テストのために元値を復元する。
+    saved = {k: os.environ.get(k) for k in ("E2B_API_URL", "E2B_API_KEY", "SSL_CERT_FILE")}
+    try:
+        # 初回: シム未稼働（port ファイルすら無い）→ オンデマンド起動 → green。
+        r1 = mod.run_untrusted("print(1)", template_id="tmpl-x")
+        assert r1["ok"] is True, r1
+        port1 = int((cube / "port").read_text())
+
+        # アイドル終了相当: シムを止めて port ファイルを stale にする。
+        _kill_shim()
+        _wait_shim_dead(port1)
+
+        # 再実行: stale port を検出 → 再起動 → 新ポートで green（接続情報の再解決）。
+        r2 = mod.run_untrusted("print(2)", template_id="tmpl-x")
+        assert r2["ok"] is True, r2
+    finally:
+        import contextlib
+
+        with contextlib.suppress(OSError):
+            _kill_shim()
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v

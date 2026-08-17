@@ -30,13 +30,16 @@ stdlib のみに依存する。
 
 from __future__ import annotations
 
+import contextlib
 import email.parser
 import email.policy
 import hmac
 import json
 import secrets
+import select
 import socket
 import ssl
+import sys
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field
@@ -45,7 +48,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from time import monotonic
 from urllib.parse import parse_qs, urlsplit
 
-from .drivers.base import Driver
+from .drivers.base import Driver, ExecutionHandle
 from .isolation import route_execution
 from .logging import get_logger
 from .models import Execution
@@ -106,13 +109,20 @@ class Request:
 
 @dataclass
 class Response:
-    """ディスパッチ出力。``stream`` があれば chunked 転送（/execute の JSON lines）。"""
+    """ディスパッチ出力。``stream`` があれば chunked 転送（/execute の JSON lines）。
+
+    ``execution`` は run_code の未完了ハンドル: HTTP 層（:class:`_Handler`）が完了を
+    待機しつつクライアント切断を監視し、切断検出時に ``cancel()`` を呼ぶ
+    （クライアント TCP 切断 = 実行キャンセル——spike §1.3）。ディスパッチ層は
+    ソケット非依存を保つため、待機・監視は HTTP 層の責務とする。
+    """
 
     status: int
     body: bytes = b""
     headers: dict[str, str] = field(default_factory=dict)
     content_type: str = "application/json"
     stream: Iterator[bytes] | None = None  # 1 要素 = 1 チャンク（/execute は 1 行 = 1 イベント）
+    execution: ExecutionHandle | None = None  # run_code の未完了実行（HTTP 層が待機・監視）
 
     @classmethod
     def json(cls, status: int, payload: object, headers: dict[str, str] | None = None) -> Response:
@@ -359,13 +369,11 @@ class ShimApp:
         code = payload.get("code")
         if code is None:
             return Response.error(400, "missing code")
-        # v0 ドライバは一括実行（非 2xx はストリーム前判定のため、exec 完了後に配信を開始する）。
-        execution = self.driver.exec(sandbox_id, str(code))
-        return Response(
-            status=200,
-            content_type="application/json",
-            stream=_execution_event_lines(execution),
-        )
+        # キャンセル可能なハンドルで実行を開始し、完了待機と切断監視は HTTP 層へ委ねる
+        # （クライアント TCP 切断 = 実行キャンセル）。非 2xx はストリーム前判定のため、
+        # イベント配信はハンドル完了後に始まる。
+        handle = self.driver.exec_start(sandbox_id, str(code))
+        return Response(status=200, content_type="application/json", execution=handle)
 
     # 操作 → ハンドラ表。
     _CONTROL_HANDLERS = {
@@ -453,6 +461,38 @@ class _Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0) or 0)
         return self.rfile.read(length) if length > 0 else b""
 
+    def _await_execution(self, handle: ExecutionHandle) -> Execution | None:
+        """実行完了を待ちつつクライアント切断を監視する。切断時は cancel して None。
+
+        HTTP/1.1 ではクライアントが応答前に追加データを送ることはないため、ソケットの
+        readable 化はほぼ切断（EOF / TLS close_notify）を意味する。recv が b"" なら切断。
+        TLS レコード不完全（SSLWantReadError）は継続する。
+        """
+        sock = self.connection
+        while True:
+            if handle.done():
+                return handle.result()
+            try:
+                readable, _, _ = select.select([sock], [], [], 0.05)
+            except (OSError, ValueError):  # ソケットが既に閉じられた。
+                readable = [sock]
+            if not readable:
+                continue
+            try:
+                data = sock.recv(1)
+            except ssl.SSLWantReadError:
+                continue
+            except OSError:
+                data = b""
+            if data == b"":
+                _log.info("run_code_client_disconnected_cancelling")
+                handle.cancel()
+                # ハンドルの後始末（結果は捨てる。例外もここで畳む）。
+                with contextlib.suppress(Exception):
+                    handle.result()
+                return None
+            # 想定外の追加データは読み捨てて継続（応答前のパイプラインは SDK に無い）。
+
     def _serve(self) -> None:
         server: ShimHTTPServer = self.server  # type: ignore[assignment]
         req = Request.from_raw(
@@ -462,6 +502,23 @@ class _Handler(BaseHTTPRequestHandler):
             resp = server.app.dispatch_data(req)
         else:
             resp = server.app.dispatch_control(req)
+
+        if resp.execution is not None:
+            # run_code: 完了待機 + 切断監視（切断 = キャンセル。応答は送らない）。
+            try:
+                execution = self._await_execution(resp.execution)
+            except Exception as exc:  # ドライバ失敗はストリーム前判定の 500 に写像。
+                _log.error("driver_call_failed op=run_code error=%s", type(exc).__name__)
+                resp = Response.error(500, f"driver error: {type(exc).__name__}")
+            else:
+                if execution is None:
+                    self.close_connection = True
+                    return
+                resp = Response(
+                    status=200,
+                    content_type="application/json",
+                    stream=_execution_event_lines(execution),
+                )
 
         self.send_response(resp.status)
         self.send_header("Content-Type", resp.content_type)
@@ -498,6 +555,14 @@ class ShimHTTPServer(ThreadingHTTPServer):
         super().__init__(server_address, _Handler)
         self.app = app
         self.plane = plane
+
+    def handle_error(self, request: object, client_address: object) -> None:
+        """接続系例外（クライアント切断等）は生 traceback を出さず logging に流す。"""
+        exc = sys.exception()
+        if isinstance(exc, BrokenPipeError | ConnectionResetError | ssl.SSLError | TimeoutError):
+            _log.info("client_connection_error type=%s", type(exc).__name__)
+            return
+        super().handle_error(request, client_address)
 
 
 def _is_loopback(host: str) -> bool:

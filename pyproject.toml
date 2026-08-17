@@ -15,9 +15,12 @@ license = "Apache-2.0"            # 3 リポジトリ共通 Apache-2.0
 authors = [{ name = "Subaco contributors" }]
 keywords = ["e2b", "sandbox", "oci", "podman", "agent"]
 
-# v0 の基盤層（config/isolation/tokens/models/drivers.base/logging/cli）は
-# stdlib のみで動作するため実行時依存はゼロ。HTTP はまず stdlib http.server で実装する。
-dependencies = []
+# HTTP/TLS は stdlib（http.server / ssl）で実装する。certifi は SSL_CERT_FILE 用の
+# 結合バンドル（certifi + シム証明書）生成に必須 — SSL_CERT_FILE は CA バンドル全体を
+# 置き換えるため、シム証明書単体のバンドルは SDK 側プロセスの通常 HTTPS を壊す。
+dependencies = [
+  "certifi",
+]
 
 [project.scripts]
 # `subaco-shim serve` でローカル HTTP シムを起動する。

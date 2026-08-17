@@ -20,12 +20,14 @@ stdlib のみに依存し、外部依存なしで import・動作する。
 from __future__ import annotations
 
 import secrets
+import threading
 import time
+from collections.abc import Callable
 
 from ..isolation import IsolationLevel
-from ..models import Execution, Logs, Result, SandboxInfo
+from ..models import Execution, ExecutionError, Logs, Result, SandboxInfo
 from . import _commands as C
-from .base import Driver
+from .base import Driver, ExecutionHandle
 
 
 class MockSandboxNotFoundError(KeyError):
@@ -34,6 +36,41 @@ class MockSandboxNotFoundError(KeyError):
 
 class MockFileNotFoundError(KeyError):
     """get_file で未書き込みのパスを読もうとした場合に送出。"""
+
+
+class MockExecutionHandle(ExecutionHandle):
+    """テスト用ハンドル。``gate`` が set されるまで完了せず、cancel を記録する。"""
+
+    def __init__(
+        self,
+        execution: Execution,
+        *,
+        gate: threading.Event | None,
+        on_cancel: Callable[[], None],
+    ) -> None:
+        self._execution = execution
+        self._gate = gate
+        self._on_cancel = on_cancel
+        self._cancelled = threading.Event()
+
+    def done(self) -> bool:
+        if self._cancelled.is_set():
+            return True
+        return self._gate is None or self._gate.is_set()
+
+    def result(self) -> Execution:
+        while not self.done():
+            # gate か cancel のどちらかを短周期で待つ（両対応の簡易ポーリング）。
+            if self._gate is not None:
+                self._gate.wait(0.02)
+        if self._cancelled.is_set():
+            return Execution(error=ExecutionError(name="Cancelled", value="client disconnected"))
+        return self._execution
+
+    def cancel(self) -> None:
+        if not self._cancelled.is_set():
+            self._cancelled.set()
+            self._on_cancel()
 
 
 class MockDriver(Driver):
@@ -49,6 +86,10 @@ class MockDriver(Driver):
         self.created_networks: list[str] = []
         self.removed_networks: list[str] = []
         self.live_networks: set[str] = set()
+        # 実行キャンセルの検証支援: exec_gate を設定すると exec_start の完了がゲートされ、
+        # cancel された sandbox_id が cancelled_execs に記録される。
+        self.exec_gate: threading.Event | None = None
+        self.cancelled_execs: list[str] = []
         # in-memory 状態。
         self._sandboxes: dict[str, SandboxInfo] = {}
         self._files: dict[tuple[str, str], bytes] = {}
@@ -101,6 +142,16 @@ class MockDriver(Driver):
         return Execution(
             results=[Result(text=code, is_main_result=True)],
             logs=Logs(stdout=[code]),
+        )
+
+    def exec_start(self, sandbox_id: str, code: str) -> MockExecutionHandle:
+        # 存在検証・記録は同期実行と同一。gate 設定時は完了を保留してキャンセル経路を
+        # 検証可能にする（クライアント切断 = 実行キャンセルの契約テスト用）。
+        execution = self.exec(sandbox_id, code)
+        return MockExecutionHandle(
+            execution,
+            gate=self.exec_gate,
+            on_cancel=lambda: self.cancelled_execs.append(sandbox_id),
         )
 
     def put_file(self, sandbox_id: str, path: str, data: bytes) -> None:
