@@ -558,7 +558,7 @@ class ShimHTTPServer(ThreadingHTTPServer):
 
     def handle_error(self, request: object, client_address: object) -> None:
         """接続系例外（クライアント切断等）は生 traceback を出さず logging に流す。"""
-        exc = sys.exception()
+        exc = sys.exc_info()[1]  # sys.exception() は 3.12+（requires-python は 3.11）。
         if isinstance(exc, BrokenPipeError | ConnectionResetError | ssl.SSLError | TimeoutError):
             _log.info("client_connection_error type=%s", type(exc).__name__)
             return

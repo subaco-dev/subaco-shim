@@ -269,13 +269,19 @@ def test_sandbox_run_on_demand_startup_and_restart(live_shim, tmp_path, monkeypa
             time.sleep(0.05)
         raise AssertionError("shim did not exit")
 
+    def _diag(result) -> str:
+        """失敗時診断: 構造化エラーとシムログを丸ごと表示する（CI での原因特定用）。"""
+        log_path = cube / "shim.log"
+        log = log_path.read_text(errors="replace") if log_path.exists() else "(no shim.log)"
+        return f"error={result['error']}\n--- shim.log ---\n{log}"
+
     # run_untrusted は接続 env（E2B_API_URL 等）を os.environ に直接書くため、
     # live_shim を使う後続テストのために元値を復元する。
     saved = {k: os.environ.get(k) for k in ("E2B_API_URL", "E2B_API_KEY", "SSL_CERT_FILE")}
     try:
         # 初回: シム未稼働（port ファイルすら無い）→ オンデマンド起動 → green。
         r1 = mod.run_untrusted("print(1)", template_id="tmpl-x")
-        assert r1["ok"] is True, r1
+        assert r1["ok"] is True, _diag(r1)
         port1 = int((cube / "port").read_text())
 
         # アイドル終了相当: シムを止めて port ファイルを stale にする。
@@ -284,7 +290,7 @@ def test_sandbox_run_on_demand_startup_and_restart(live_shim, tmp_path, monkeypa
 
         # 再実行: stale port を検出 → 再起動 → 新ポートで green（接続情報の再解決）。
         r2 = mod.run_untrusted("print(2)", template_id="tmpl-x")
-        assert r2["ok"] is True, r2
+        assert r2["ok"] is True, _diag(r2)
     finally:
         import contextlib
 
