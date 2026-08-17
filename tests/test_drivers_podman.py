@@ -110,7 +110,7 @@ def test_exec_start_drains_large_output_without_deadlock(tmp_path):
 
     # 5MB 出力（pipe 容量 64KB を大きく超える）後に長時間 sleep = 終わらない実行。
     binary = _fake_podman(tmp_path, "head -c 5000000 /dev/zero | tr '\\0' 'a'\nsleep 30")
-    d = PodmanDriver(binary=binary, timeout=1.0)
+    d = PodmanDriver(binary=binary, exec_timeout=1.0)
     start = time.monotonic()
     handle = d.exec_start("sbx1", "code")
     while not handle.done() and time.monotonic() - start < 10:
@@ -127,7 +127,7 @@ def test_exec_start_cancel_kills_running_process(tmp_path):
     import time
 
     binary = _fake_podman(tmp_path, "sleep 30")
-    d = PodmanDriver(binary=binary, timeout=60.0)
+    d = PodmanDriver(binary=binary, exec_timeout=60.0)
     start = time.monotonic()
     handle = d.exec_start("sbx1", "code")
     handle.cancel()
@@ -139,8 +139,40 @@ def test_exec_start_cancel_kills_running_process(tmp_path):
 
 def test_exec_start_normal_completion(tmp_path):
     binary = _fake_podman(tmp_path, "echo out-line")
-    d = PodmanDriver(binary=binary, timeout=10.0)
+    d = PodmanDriver(binary=binary, exec_timeout=10.0)
     execution = d.exec("sbx1", "code")
     assert execution.error is None
     assert execution.text == "out-line\n"
     assert execution.logs.stdout == ["out-line"]
+
+
+def test_exec_output_capped_without_oom(tmp_path):
+    """未信頼コードの大量出力はホスト側で上限まで蓄積し、超過は読み捨て + 注記する。"""
+    # 8MB 出力（上限 1MB の 8 倍）。読み捨てが機能すればデッドロックせず完走する。
+    binary = _fake_podman(tmp_path, "head -c 8000000 /dev/zero | tr '\\0' 'a'")
+    d = PodmanDriver(binary=binary, exec_timeout=30.0, exec_max_output=1024 * 1024)
+    execution = d.exec("sbx1", "code")
+    total = sum(len(line) for line in execution.logs.stdout)
+    assert total <= 1024 * 1024, "蓄積が上限を超えてはならない"
+    # 切り詰めの事実は stderr に注記される（結果欠落の明示）。
+    assert any("truncated" in line for line in execution.logs.stderr)
+
+
+def test_exec_timeout_env_override(tmp_path, monkeypatch):
+    """SUBACO_SHIM_EXEC_TIMEOUT でハード上限を設定できる（0 以下 = 無期限）。"""
+    import time
+
+    binary = _fake_podman(tmp_path, "sleep 2\necho done")
+    # 1 秒制限 → ExecTimeout。
+    monkeypatch.setenv("SUBACO_SHIM_EXEC_TIMEOUT", "1")
+    d1 = PodmanDriver(binary=binary)
+    ex1 = d1.exec("sbx1", "code")
+    assert ex1.error is not None and ex1.error.name == "ExecTimeout"
+    # 0 = 無期限 → 同じスクリプトが完走する（既定 120 秒固定の打ち切りが無いことの対比）。
+    monkeypatch.setenv("SUBACO_SHIM_EXEC_TIMEOUT", "0")
+    d2 = PodmanDriver(binary=binary)
+    start = time.monotonic()
+    ex2 = d2.exec("sbx1", "code")
+    assert time.monotonic() - start < 30
+    assert ex2.error is None
+    assert ex2.text == "done\n"

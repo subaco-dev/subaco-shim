@@ -41,8 +41,49 @@ _log = get_logger("drivers.podman")
 # システムインストール済み podman の優先探索パス（システム podman を優先検出）。
 _SYSTEM_PODMAN_PATHS = ("/usr/bin/podman", "/usr/local/bin/podman", "/opt/podman/bin/podman")
 
-# 既定の実行タイムアウト（秒）。run_code は将来ストリーミング対応で見直す（TODO）。
-_DEFAULT_TIMEOUT = 120.0
+# 制御系 podman コマンド（network / run / stop / rm / put / get）のタイムアウト（秒）。
+_DEFAULT_COMMAND_TIMEOUT = 120.0
+
+# run_code ハード上限の既定（秒）。**第一のタイムアウトは SDK 側の run_code(timeout=...)**
+# （read タイムアウト → 切断 → シムがキャンセル）であり、これはクライアント消失・切断検出
+# 漏れ時に未信頼コードを走らせ続けないための保険。SUBACO_SHIM_EXEC_TIMEOUT で上書き可
+# （0 以下 = 無効 / 無期限）。
+_DEFAULT_EXEC_TIMEOUT = 3600.0
+
+# 実行出力（stdout/stderr 各系統）のホスト側蓄積上限の既定（バイト）。未信頼コードの
+# 出力し続けによるホスト OOM を防ぐ。超過分は読み捨て（pipe は読み続けるためデッド
+# ロックしない）、切り詰めの事実を stderr へ注記する。SUBACO_SHIM_EXEC_MAX_OUTPUT で
+# 上書き可（0 以下 = 無制限）。
+_DEFAULT_EXEC_MAX_OUTPUT = 10 * 1024 * 1024
+
+# reader スレッドの読み取り単位。
+_READ_CHUNK = 65536
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def resolve_exec_timeout() -> float | None:
+    """run_code ハード上限を解決する（env 上書き可。0 以下は None = 無期限）。"""
+    val = _env_float("SUBACO_SHIM_EXEC_TIMEOUT", _DEFAULT_EXEC_TIMEOUT)
+    return None if val <= 0 else val
+
+
+def resolve_exec_max_output() -> int | None:
+    """実行出力の蓄積上限を解決する（env 上書き可。0 以下は None = 無制限）。"""
+    val = _env_float("SUBACO_SHIM_EXEC_MAX_OUTPUT", _DEFAULT_EXEC_MAX_OUTPUT)
+    return None if val <= 0 else int(val)
+
+
+# 「env から解決」と「明示 None（無期限/無制限）」を区別するための番兵。
+_UNSET = object()
 
 # 非 NixOS Linux rootless 前提が欠けたときに提示する runbook（受け入れ条件）。
 RUNBOOK_ROOTLESS = (
@@ -157,24 +198,63 @@ class PodmanExecutionHandle(ExecutionHandle):
     """``podman exec`` の Popen ハンドル。cancel はホスト側 exec プロセスを kill する。
 
     クライアント TCP 切断 = 実行キャンセル（spike §1.3）の実装。**実行開始時から
-    バックグラウンドスレッドが stdout/stderr をドレーンする**（``communicate`` が
-    pipe を読み続ける）——待ってから読む方式は pipe 容量超の大量出力でプロセスが
-    write ブロックしたまま終了できず、デッドロックする。ドライバ側タイムアウトも
-    同スレッドで実効化する（超過は kill → ExecTimeout）。exec プロセスの kill で
+    reader スレッドが stdout/stderr を上限付きでドレーンする**——待ってから読む方式は
+    pipe 容量超の大量出力でプロセスが write ブロックしたまま終了できずデッドロックし、
+    無制限の蓄積は未信頼コードの出力し続けによるホスト OOM を許す。上限（``max_output``）
+    超過分は**読み捨て**（pipe は読み続ける）、切り詰めの事実を stderr へ注記する。
+    ドライバ側ハード上限（``timeout``。None = 無期限）は監視スレッドで実効化する
+    （超過はプロセスグループごと SIGKILL → ExecTimeout）。exec プロセスの kill で
     コンテナ内プロセスまで確実に止まるかはバックエンド依存のため、実コンテナでの検証は
     podman nightly / 実機統合の対象（コンテナ自体は destroy 時に停止・削除される）。
+
+    **v0 の配信は一括**: イベントは実行完了後にまとめて JSON lines 化される（SDK の
+    ``on_stdout`` 等へは完了後に届く）。逐次ストリーミングはドライバ抽象のストリーム化
+    （M3 候補）で扱う。
     """
 
-    def __init__(self, proc: subprocess.Popen[bytes], *, timeout: float) -> None:
+    def __init__(
+        self,
+        proc: subprocess.Popen[bytes],
+        *,
+        timeout: float | None,
+        max_output: int | None,
+    ) -> None:
         self._proc = proc
         self._timeout = timeout
+        self._max_output = max_output
         self._cancelled = False
         self._timed_out = False
-        self._stdout = b""
-        self._stderr = b""
+        self._stdout_buf = bytearray()
+        self._stderr_buf = bytearray()
+        self._truncated = [False, False]
         self._finished = threading.Event()
-        self._drainer = threading.Thread(target=self._drain, daemon=True)
-        self._drainer.start()
+        self._readers = [
+            threading.Thread(
+                target=self._read_stream, args=(proc.stdout, self._stdout_buf, 0), daemon=True
+            ),
+            threading.Thread(
+                target=self._read_stream, args=(proc.stderr, self._stderr_buf, 1), daemon=True
+            ),
+        ]
+        for t in self._readers:
+            t.start()
+        self._watcher = threading.Thread(target=self._watch, daemon=True)
+        self._watcher.start()
+
+    def _read_stream(self, stream: object, buf: bytearray, idx: int) -> None:
+        """pipe を EOF まで読み続ける（上限到達後は読み捨て——書き手をブロックさせない）。"""
+        while True:
+            chunk = stream.read(_READ_CHUNK)
+            if not chunk:
+                return
+            if self._max_output is None:
+                buf.extend(chunk)
+                continue
+            room = self._max_output - len(buf)
+            if room > 0:
+                buf.extend(chunk[:room])
+            if room < len(chunk):
+                self._truncated[idx] = True
 
     def _kill_group(self) -> None:
         """exec プロセスを**プロセスグループごと** kill する。
@@ -188,36 +268,39 @@ class PodmanExecutionHandle(ExecutionHandle):
         except (ProcessLookupError, PermissionError, OSError):
             self._proc.kill()
 
-    def _drain(self) -> None:
-        """pipe を読み切りつつ完了・タイムアウトを監視する（開始直後から常時実行）。"""
+    def _watch(self) -> None:
+        """プロセス完了とハード上限を監視する（pipe とは独立の wait ベース）。"""
         try:
-            self._stdout, self._stderr = self._proc.communicate(timeout=self._timeout)
+            self._proc.wait(timeout=self._timeout)
         except subprocess.TimeoutExpired:
             self._timed_out = True
             _log.warning("exec_timeout pid=%s timeout=%ss", self._proc.pid, self._timeout)
             self._kill_group()
-            try:
-                self._stdout, self._stderr = self._proc.communicate(timeout=5.0)
-            except subprocess.TimeoutExpired:
-                # killpg 後も何かが pipe を保持する異常系。読み残しは諦めて閉じる。
+            self._proc.wait()
+        # killpg 後も孫プロセスが pipe を保持する異常系に備え、reader は有限時間だけ待つ
+        # （daemon スレッドのため残っても後始末はプロセス終了時に回収される）。
+        for t in self._readers:
+            t.join(timeout=5.0)
+            if t.is_alive():
                 _log.error("exec_drain_stuck pid=%s", self._proc.pid)
-                for stream in (self._proc.stdout, self._proc.stderr):
-                    if stream is not None:
-                        stream.close()
-        finally:
-            self._finished.set()
+        self._finished.set()
 
     def done(self) -> bool:
         return self._finished.is_set()
 
     def result(self) -> Execution:
         self._finished.wait()
-        stdout = self._stdout.decode("utf-8", "replace")
-        stderr = self._stderr.decode("utf-8", "replace")
+        stdout = bytes(self._stdout_buf).decode("utf-8", "replace")
+        stderr = bytes(self._stderr_buf).decode("utf-8", "replace")
         logs = Logs(
             stdout=stdout.splitlines() if stdout else [],
             stderr=stderr.splitlines() if stderr else [],
         )
+        if any(self._truncated):
+            _log.warning(
+                "exec_output_truncated pid=%s max_output=%s", self._proc.pid, self._max_output
+            )
+            logs.stderr.append(f"[output truncated at {self._max_output} bytes per stream]")
         if self._cancelled:
             return Execution(
                 logs=logs,
@@ -252,10 +335,23 @@ class PodmanDriver(Driver):
     name = "podman"
     isolation_level = IsolationLevel.SHARED_KERNEL
 
-    def __init__(self, *, binary: str | None = None, timeout: float = _DEFAULT_TIMEOUT) -> None:
+    def __init__(
+        self,
+        *,
+        binary: str | None = None,
+        command_timeout: float = _DEFAULT_COMMAND_TIMEOUT,
+        exec_timeout: float | None | object = _UNSET,
+        exec_max_output: int | None | object = _UNSET,
+    ) -> None:
         # 検出は遅延（None のまま保持。呼び出し時に _ensure_ready で解決）。
         self._binary: str | None = binary
-        self._timeout = timeout
+        # 制御系（network/run/stop 等）と run_code ハード上限は別物: 前者は固定短時間、
+        # 後者は SDK タイムアウトの保険（env で調整可・無効化可——モジュール先頭コメント）。
+        self._command_timeout = command_timeout
+        self._exec_timeout = resolve_exec_timeout() if exec_timeout is _UNSET else exec_timeout
+        self._exec_max_output = (
+            resolve_exec_max_output() if exec_max_output is _UNSET else exec_max_output
+        )
         self._checked = False
         self._sandboxes: dict[str, SandboxInfo] = {}
         # 実行した podman フル argv の記録（診断・テスト補助）。
@@ -301,7 +397,7 @@ class PodmanDriver(Driver):
                 argv,
                 input=input,
                 capture_output=True,
-                timeout=self._timeout,
+                timeout=self._command_timeout,
             )
         except FileNotFoundError as exc:
             _log.error("driver_command_failed driver=podman reason=binary-not-found")
@@ -365,7 +461,9 @@ class PodmanDriver(Driver):
         except FileNotFoundError as exc:
             _log.error("driver_command_failed driver=podman reason=binary-not-found")
             raise PodmanUnavailableError(str(exc)) from exc
-        return PodmanExecutionHandle(proc, timeout=self._timeout)
+        return PodmanExecutionHandle(
+            proc, timeout=self._exec_timeout, max_output=self._exec_max_output
+        )
 
     def put_file(self, sandbox_id: str, path: str, data: bytes) -> None:
         cont = C.container_name(sandbox_id)

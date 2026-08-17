@@ -1,14 +1,14 @@
 # requirements-shim.txt — テンプレート同梱の固定 requirements のプレースホルダ
 #
-# この repo の基盤層（config/isolation/tokens/models/drivers.base/logging/cli）は
-# stdlib のみで動作するため実行時依存はゼロ。実行プレーンの本実装（sandbox_run.py /
-# E2B SDK 経路）が入った段階で、固定 requirements をリリース時に生成する。
+# 実行時依存は certifi のみ（SSL_CERT_FILE 用の certifi 結合 CA バンドル生成に必須）。
+# リリース時に uv export で hash 付き固定 requirements を生成する（certifi が載るのが正常）。
 #
 # 生成手順（リリース時）:
-#   uv export --frozen --no-dev --format requirements-txt > requirements-shim.txt
+#   uv export --frozen --no-dev --no-emit-project --format requirements-txt > requirements-shim.txt
 #
 # devShell の起動スクリプト（cube-shim）はこれを使って
 #   uvx --with-requirements requirements-shim.txt subaco-shim==<固定版> serve
-# の形で E2B SDK 等の推移依存を完全固定する。
+# の形で推移依存を完全固定する。
 #
-# v0（未公開・version 0.0.0）ではプレースホルダのみ。実依存は空。
+# v0（未公開・version 0.0.0）ではプレースホルダのみ。実ピンは PyPI 公開後の
+# リリースフローで生成・置換する（RELEASING.md）。

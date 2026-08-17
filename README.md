@@ -40,6 +40,27 @@ E2B API 互換のローカル実行シム。エージェント生成コードを
 - 実 SDK をクライアントに使うワイヤ契約 E2E は `tests/test_wire_contract.py`（`just test-wire`。
   CI の wire-contract ジョブが ubuntu + macos で実行）。
 
+### 実行タイムアウトと出力上限（run_code）
+
+タイムアウトの優先規則:
+
+1. **第一は SDK 側の `run_code(timeout=...)`**（既定 300 秒・`0` は無期限）。read
+   タイムアウトとして働き、超過でクライアントが切断 → シムが切断を検出して実行を
+   キャンセルする（`tests/test_wire_contract.py` が検証）。
+2. **シム側ハード上限 `SUBACO_SHIM_EXEC_TIMEOUT`**（既定 3600 秒・`0` 以下で無効）は
+   クライアント消失・切断検出漏れ時に未信頼コードを走らせ続けないための保険。超過は
+   プロセスグループごと kill し、`ExecTimeout` エラーとして返す。SDK の指定より
+   短く設定すればこちらが先に効く（ホスト管理者のポリシー）。
+
+出力上限: 未信頼コードの出力し続けによるホスト OOM を防ぐため、stdout/stderr は
+各系統 `SUBACO_SHIM_EXEC_MAX_OUTPUT` バイト（既定 10MB・`0` 以下で無制限)まで蓄積し、
+超過分は**読み捨てる**（pipe は読み続けるためデッドロックしない）。切り詰め時は
+stderr 末尾に注記が入る。
+
+制限（v0）: `/execute` のイベント配信は**実行完了後の一括**であり、SDK の
+`on_stdout` 等のコールバックへ逐次には届かない（逐次ストリーミングはドライバ抽象の
+ストリーム化として M3 候補）。
+
 ## 隔離モデルと default-deny
 
 ```
@@ -237,7 +258,7 @@ NixOS では対象外（`/etc/NIXOS` 検出でスキップ）。
 ## 開発
 
 ```bash
-just test      # pytest（stdlib 層は外部依存なしで green。SDK 契約テストは skip）
+just test      # pytest（実行時依存 certifi は uv run が解決。SDK 契約テストは skip）
 just test-wire # ワイヤ契約 E2E（実 E2B SDK 固定版。要 `just sync` + openssl）
 just lint      # ruff check
 just fmt       # ruff format

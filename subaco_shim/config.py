@@ -36,6 +36,10 @@ class EnvKeys:
     SSL_CERT_FILE = "SSL_CERT_FILE"  # certifi+シム証明書の結合バンドル（.cube/tls/ca-bundle.pem）
     CUBE_TEMPLATE_ID = "CUBE_TEMPLATE_ID"  # digest 固定 OCI イメージ参照
     SUBACO_SHIM_LOG_LEVEL = "SUBACO_SHIM_LOG_LEVEL"  # 診断ログレベル
+    # run_code のハード上限秒（保険。第一は SDK の run_code(timeout)——README 参照）。
+    SUBACO_SHIM_EXEC_TIMEOUT = "SUBACO_SHIM_EXEC_TIMEOUT"
+    # 実行出力の系統別蓄積上限バイト（ホスト OOM 防止。超過は読み捨て + stderr 注記）。
+    SUBACO_SHIM_EXEC_MAX_OUTPUT = "SUBACO_SHIM_EXEC_MAX_OUTPUT"
     # E2B_SANDBOX_URL / E2B_DEBUG は不使用（spike 確定: 前者は run_code に効かず、
     # 後者は create/kill が HTTP に出ない——05_spike結果 §2）。
 

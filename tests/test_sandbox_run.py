@@ -509,3 +509,18 @@ def test_post_destroy_failure_does_not_break_result():
     # 後始末の失敗はベストエフォート（結果を壊さない）。
     assert result["ok"] is True
     assert result["error"] is None
+
+
+def test_startup_failure_without_winner_reports_rc(tmp_path, monkeypatch):
+    """勝者が現れない単独失敗は deadline 経過後に、記録した終了コード付きで診断される。
+
+    起動プロセスの即時終了は flock 敗者と区別できないため deadline まで待つ仕様
+    （マルチエージェント同時初回実行との両立）。診断はタイムアウト時にまとめて出す。
+    """
+    mod = _load_module()
+    cube = tmp_path / ".cube"
+    cube.mkdir()
+    monkeypatch.setenv("CUBE_SHIM_CMD", "false")  # 即 exit 1・勝者なし。
+    with pytest.raises(RuntimeError) as exc:
+        mod._ensure_shim_running(cube, wait=1.0)
+    assert "rc=1" in str(exc.value)

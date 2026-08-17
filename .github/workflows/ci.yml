@@ -2,7 +2,7 @@
 #
 # 方針:
 # - lint（ruff check + format --check）と test（pytest / mock ドライバ）を
-#   ubuntu + macos マトリクスで実行する。基盤層は stdlib のみで動くため外部依存ゼロで green。
+#   ubuntu + macos マトリクスで実行する。実行時依存は certifi のみ（uv run が解決）。
 # - podman の実コンテナ統合は **nightly**（schedule）で ubuntu のみ実行する。実バイナリ検出に
 #   依存するテストは `shutil.which("podman")` ガードで skip されるため、通常の PR/push では走らない。
 name: CI
@@ -49,7 +49,7 @@ jobs:
         uses: astral-sh/setup-uv@v5
         with:
           python-version: "3.11"
-      - name: pytest（mock ドライバ・stdlib 層は外部依存なしで green）
+      - name: pytest（mock ドライバ。実行時依存 certifi は uv run が解決）
         run: uv run --with pytest pytest -q
 
   wire-contract:

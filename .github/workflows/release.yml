@@ -46,12 +46,24 @@ jobs:
         run: uv build
 
       - name: wheel スモーク（隔離環境で配布物の import・依存解決を検証）
+        # checkout ディレクトリで実行するとカレントの subaco_shim/ が sys.path で勝ち、
+        # wheel が壊れていても green になる。ソースツリー外へ移動し、import 元が
+        # site-packages（= wheel 由来）であることも assert する。
         run: |
-          uv run --isolated --no-project --python 3.11 --with dist/*.whl \
-            python -c "import subaco_shim, certifi; from subaco_shim.cli import main; print('wheel ok')"
+          set -euo pipefail
+          whl="$(ls "$PWD"/dist/*.whl)"
+          cd "$RUNNER_TEMP"
+          uv run --isolated --no-project --python 3.11 --with "$whl" python -c "
+          import pathlib, subaco_shim, certifi
+          from subaco_shim.cli import main
+          origin = pathlib.Path(subaco_shim.__file__).resolve()
+          assert 'site-packages' in str(origin), f'not imported from wheel: {origin}'
+          print('wheel ok:', origin)
+          "
 
       - name: 固定 requirements の生成（テンプレート同梱用）
-        # 実行時依存ゼロのため通常は空に近いが、hive 側と同型の手順で生成・添付する
+        # 実行時依存は certifi のみ（SSL_CERT_FILE 用結合バンドル生成に必須）で、
+        # requirements には certifi が hash 付きで載る。hive 側と同型の手順で生成・添付する
         # （起動スクリプトは `uvx --with-requirements requirements-shim.txt subaco-shim==<版>`）。
         run: |
           uv export --no-dev --no-emit-project --format requirements-txt \

@@ -9,7 +9,7 @@ default:
 sync:
     uv sync --extra test --extra dev
 
-# テスト（stdlib のみで動く基盤層は外部依存なしで green。SDK 契約テストは skip される）
+# テスト（uv run がプロジェクト依存 certifi を解決。SDK 契約テストは skip される）
 test:
     uv run --with pytest pytest -q
 
