@@ -43,11 +43,11 @@ SDK 契約・構造化出力形状の参照実装として同梱しています�
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import os
 import shlex
 import shutil
-import socket
 import subprocess
 import sys
 import time
@@ -107,16 +107,40 @@ def _read_cube_port(cube_dir: Path) -> int | None:
         return None
 
 
-def _shim_reachable(cube_dir: Path) -> bool:
-    """``.cube/port`` のシムへ TCP 接続できるか（稼働判定）。"""
-    port = _read_cube_port(cube_dir)
-    if port is None:
-        return False
+def _read_cube_token(cube_dir: Path) -> str | None:
     try:
-        with socket.create_connection(("127.0.0.1", port), timeout=0.5):
-            return True
+        token = (cube_dir / "token").read_text(encoding="ascii").strip()
     except OSError:
+        return None
+    return token or None
+
+
+def _shim_reachable(cube_dir: Path) -> bool:
+    """``.cube/port`` の相手が**このプロジェクトのシム本人**かを認証付き probe で確認する。
+
+    TCP 接続可否だけでは、シム終了後に別プロセスへ再利用された stale port を
+    「稼働中」と誤判定する。制御プレーンへ ``X-API-KEY``（``.cube/token``）付きで
+    実在しない sandbox の get_info を投げ、**認証が通った上での 404**（E2B エラー形
+    ``{"code": 404}``）をシム本人の証拠とする。401（トークン不一致）・非 HTTP・
+    接続失敗はすべて非稼働扱い（起動経路へ）。
+    """
+    port = _read_cube_port(cube_dir)
+    token = _read_cube_token(cube_dir)
+    if port is None or token is None:
         return False
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=1.0)
+    try:
+        conn.request("GET", "/sandboxes/cube-shim-probe", headers={"X-API-KEY": token})
+        resp = conn.getresponse()
+        body = resp.read()
+        if resp.status != 404:
+            return False
+        payload = json.loads(body)
+        return isinstance(payload, dict) and payload.get("code") == 404
+    except (OSError, ValueError, http.client.HTTPException):
+        return False
+    finally:
+        conn.close()
 
 
 def _shim_launcher() -> list[str] | None:
@@ -165,24 +189,25 @@ def _ensure_shim_running(cube_dir: Path, *, wait: float | None = None) -> None:
             start_new_session=True,
         )
     deadline = time.monotonic() + wait
+    launcher_rc: int | None = None
     while time.monotonic() < deadline:
         if _shim_reachable(cube_dir):
             return
-        if proc.poll() is not None:
-            # 起動プロセスが終了。並行起動の敗者（flock で即終了）の可能性があるため、
-            # 少しだけ稼働側の出現を待ってからエラーにする。
-            grace = time.monotonic() + 2.0
-            while time.monotonic() < grace:
-                if _shim_reachable(cube_dir):
-                    return
-                time.sleep(0.1)
-            tail = _tail_text(log_path)
-            raise RuntimeError(
-                f"シム起動プロセスが接続可能になる前に終了しました"
-                f"（rc={proc.returncode}）。{log_path} 末尾:\n{tail}"
-            )
+        if launcher_rc is None:
+            # 起動プロセスの終了は記録するだけで待機は続ける: 並行起動の敗者
+            # （flock で即終了）でも、勝者が接続可能になるのは deadline までの
+            # どの時点でもあり得る（マルチエージェントの同時初回実行）。
+            launcher_rc = proc.poll()
         time.sleep(0.1)
-    raise RuntimeError(f"シムの起動を {wait} 秒待ちましたが接続できません（{log_path} を確認）")
+    detail = (
+        f"起動プロセスは rc={launcher_rc} で終了済み"
+        if launcher_rc is not None
+        else "起動プロセスは応答のないまま"
+    )
+    raise RuntimeError(
+        f"シムの起動を {wait} 秒待ちましたが接続できません（{detail}）。"
+        f"{log_path} 末尾:\n{_tail_text(log_path)}"
+    )
 
 
 def _tail_text(path: Path, limit: int = 2000) -> str:
@@ -346,6 +371,28 @@ def _run_post_create(sandbox: Any, hook: Callable[[Any], None] | None) -> None:
         )
 
 
+def _run_post_destroy(sandbox_id: str, hook: Callable[[str], None] | None) -> None:
+    """サンドボックス破棄後の後始末（post-create の対）。ベストエフォートで実行する。
+
+    ``hook`` 引数が最優先。無ければ ``CUBE_POST_DESTROY_CMD``（<cmd> <sandbox_id>）。
+    /etc/hosts フォールバックエントリの削除等に使う。失敗しても実行結果は壊さない
+    （警告を stderr へ出すのみ）。
+    """
+    try:
+        if hook is not None:
+            hook(sandbox_id)
+            return
+        cmd = os.environ.get("CUBE_POST_DESTROY_CMD")
+        if cmd:
+            subprocess.run(  # noqa: S603 - コマンドはホスト側設定由来
+                [*shlex.split(cmd), sandbox_id],
+                check=True,
+                timeout=POST_CREATE_CMD_TIMEOUT,
+            )
+    except Exception as exc:  # noqa: BLE001 - 後始末の失敗は結果を壊さない
+        print(f"warning: post-destroy hook failed: {exc}", file=sys.stderr)
+
+
 # --- 本体 ---------------------------------------------------------------------
 
 
@@ -358,6 +405,7 @@ def run_untrusted(
     retries: int = DEFAULT_CREATE_RETRIES,
     retry_wait: float = DEFAULT_RETRY_WAIT,
     post_create_hook: Callable[[Any], None] | None = None,
+    post_destroy_hook: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     """コードを隔離環境で実行し、hive_remember に渡せる構造化 dict を返す。
 
@@ -371,6 +419,8 @@ def run_untrusted(
         retry_wait: 再試行の初回待機秒（指数バックオフ）。
         post_create_hook: create 後・run_code 前に呼ぶ補助処理（無ければ
             ``CUBE_POST_CREATE_CMD``）。
+        post_destroy_hook: サンドボックス破棄後の後始末（無ければ
+            ``CUBE_POST_DESTROY_CMD``。ベストエフォート——失敗は結果を壊さない）。
 
     返り値（構造化出力）:
         ``ok`` / ``text`` / ``isolation_level`` / ``template_id`` / ``execution`` / ``error``。
@@ -397,6 +447,7 @@ def run_untrusted(
         _ensure_shim_running(cube_dir)
         _resolve_connection(cube_dir)
 
+    cleanup_sid: str | None = None
     try:
         if cube_dir is not None:
             _reconnect()
@@ -408,6 +459,8 @@ def run_untrusted(
             retry_wait=retry_wait,
             reconnect=_reconnect if cube_dir is not None else None,
         ) as sb:
+            # 破棄後の後始末対象（post-create が部分実行でも cleanup が走るよう先に記録）。
+            cleanup_sid = str(sb.sandbox_id)
             # ID 取得後・データプレーン接続前の補助処理（/etc/hosts フォールバック等）。
             _run_post_create(sb, post_create_hook)
             # timeout=None は kwargs ごと省略し SDK 既定（300 秒）に委ねる。
@@ -426,6 +479,10 @@ def run_untrusted(
             result["ok"] = getattr(execution, "error", None) is None
     except Exception as exc:  # noqa: BLE001 - 呼び出し元へ構造化エラーで返す
         result["error"] = f"{type(exc).__name__}: {exc}"
+    finally:
+        # サンドボックス破棄（with の __exit__ = kill）後の後始末（hosts エントリ削除等）。
+        if cleanup_sid is not None:
+            _run_post_destroy(cleanup_sid, post_destroy_hook)
     return result
 
 

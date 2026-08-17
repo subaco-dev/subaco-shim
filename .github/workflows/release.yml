@@ -36,12 +36,19 @@ jobs:
           echo "tag=$tag pyproject=$proj _version=$mod"
           [ "$tag" = "$proj" ] && [ "$tag" = "$mod" ] || { echo "::error::タグとパッケージ版が一致しません"; exit 1; }
 
-      - name: テスト（stdlib 層・mock ドライバ）
+      - name: テスト（ロック済み project 環境・mock ドライバ）
+        # --no-project はプロジェクトの実行時依存（certifi）を導入しないため使わない。
         run: |
-          uv run --python 3.11 --with pytest --no-project pytest -q
+          uv sync --locked --extra test --python 3.11
+          uv run pytest -q
 
       - name: ビルド（sdist + wheel）
         run: uv build
+
+      - name: wheel スモーク（隔離環境で配布物の import・依存解決を検証）
+        run: |
+          uv run --isolated --no-project --python 3.11 --with dist/*.whl \
+            python -c "import subaco_shim, certifi; from subaco_shim.cli import main; print('wheel ok')"
 
       - name: 固定 requirements の生成（テンプレート同梱用）
         # 実行時依存ゼロのため通常は空に近いが、hive 側と同型の手順で生成・添付する

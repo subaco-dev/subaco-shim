@@ -86,3 +86,61 @@ def test_argv_builders():
     assert "-v" not in run  # ホストマウント禁止。
     assert "--network" in run and net in run
     assert C.get_file_argv("cube-sb-abc123", "/p") == ["exec", "cube-sb-abc123", "cat", "--", "/p"]
+
+
+# --- exec_start（drain スレッド・タイムアウト・キャンセル）: fake バイナリで実プロセス検証 ---
+
+
+def _fake_podman(tmp_path, script_body: str):
+    """podman の代わりに使う実行可能スクリプト（exec サブコマンドを模擬）。"""
+    fake = tmp_path / "fake-podman"
+    fake.write_text(f"#!/bin/sh\n{script_body}\n")
+    fake.chmod(0o755)
+    return str(fake)
+
+
+def test_exec_start_drains_large_output_without_deadlock(tmp_path):
+    """pipe 容量超の大量出力でもデッドロックせず、ドライバ側 timeout が実効すること。
+
+    レビュー指摘の再現: 「待ってから読む」方式では 5MB 出力でプロセスが write
+    ブロックしたまま終了できず、timeout も効かなかった。drain スレッドが開始直後から
+    pipe を読み続けることで、大量出力でも timeout 超過 → kill → ExecTimeout になる。
+    """
+    import time
+
+    # 5MB 出力（pipe 容量 64KB を大きく超える）後に長時間 sleep = 終わらない実行。
+    binary = _fake_podman(tmp_path, "head -c 5000000 /dev/zero | tr '\\0' 'a'\nsleep 30")
+    d = PodmanDriver(binary=binary, timeout=1.0)
+    start = time.monotonic()
+    handle = d.exec_start("sbx1", "code")
+    while not handle.done() and time.monotonic() - start < 10:
+        time.sleep(0.05)
+    assert handle.done(), "大量出力でハンドルがデッドロックしてはならない"
+    execution = handle.result()
+    elapsed = time.monotonic() - start
+    assert elapsed < 8, f"ドライバ timeout(1s) が実効していない: {elapsed:.1f}s"
+    assert execution.error is not None
+    assert execution.error.name == "ExecTimeout"
+
+
+def test_exec_start_cancel_kills_running_process(tmp_path):
+    import time
+
+    binary = _fake_podman(tmp_path, "sleep 30")
+    d = PodmanDriver(binary=binary, timeout=60.0)
+    start = time.monotonic()
+    handle = d.exec_start("sbx1", "code")
+    handle.cancel()
+    execution = handle.result()  # kill 済みのため速やかに返る。
+    assert time.monotonic() - start < 5
+    assert execution.error is not None
+    assert execution.error.name == "Cancelled"
+
+
+def test_exec_start_normal_completion(tmp_path):
+    binary = _fake_podman(tmp_path, "echo out-line")
+    d = PodmanDriver(binary=binary, timeout=10.0)
+    execution = d.exec("sbx1", "code")
+    assert execution.error is None
+    assert execution.text == "out-line\n"
+    assert execution.logs.stdout == ["out-line"]

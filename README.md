@@ -142,21 +142,51 @@ systemd-resolved 非稼働環境では解決されない**（Ubuntu 24.04 コン
    49999-<sandbox_id>.sbx.localhost`）。
 2. **TLS 検証**: 追加作業不要（`ca-bundle.pem` を `SSL_CERT_FILE` に指す既定構成のまま）。
 
-ワンショット実行（`sandbox_run.py`）では **post-create フック**で自動追記する:
-sandbox ID 取得後・データプレーン接続前に `CUBE_POST_CREATE_CMD` のコマンドが
-`<cmd> <sandbox_id>` として呼ばれる（非ゼロ終了は実行中断）。例:
+ワンショット実行（`sandbox_run.py`）では **post-create / post-destroy フック**で
+追記と削除を自動化する: sandbox ID 取得後・データプレーン接続前に
+`CUBE_POST_CREATE_CMD`、破棄後に `CUBE_POST_DESTROY_CMD` のコマンドが
+`<cmd> <sandbox_id>` として呼ばれる（post-create の非ゼロ終了は実行中断、
+post-destroy はベストエフォート）。
+
+セキュリティ上の要点: **sudoers で許可するのは root 所有の helper 1 本だけ**にする。
+`tee -a /etc/hosts` 等の汎用コマンドを NOPASSWD にすると、エージェントに任意の
+hosts 追記権限を渡すことになる。ID 検証・flock 排他・マーカー付きエントリの
+追加/削除は helper 内で完結させる:
 
 ```bash
-# /usr/local/bin/cube-hosts-add（sudoers で NOPASSWD 限定を推奨）
+# /usr/local/bin/cube-hosts — root 所有・非 root 書込不可にする:
+#   sudo install -o root -g root -m 0755 cube-hosts /usr/local/bin/cube-hosts
+# sudoers（visudo）はこの helper だけを NOPASSWD 許可する:
+#   youruser ALL=(root) NOPASSWD: /usr/local/bin/cube-hosts
 #!/bin/sh
 set -eu
-sid="$1"
-line="127.0.0.1 49983-${sid}.sbx.localhost 49999-${sid}.sbx.localhost"
-grep -qF "$line" /etc/hosts || echo "$line" | sudo tee -a /etc/hosts >/dev/null
+op="${1:?usage: cube-hosts add|remove <sandbox_id>}"
+sid="${2:?missing sandbox_id}"
+# sandbox_id はシム生成の hex（余裕を見て英数とハイフンのみ許可。他は拒否）。
+case "$sid" in
+  *[!A-Za-z0-9-]* | "") echo "cube-hosts: invalid sandbox id" >&2; exit 1 ;;
+esac
+marker="# cube-sbx:${sid}"
+line="127.0.0.1 49983-${sid}.sbx.localhost 49999-${sid}.sbx.localhost ${marker}"
+# 並行実行の排他（flock は Linux 前提——本フォールバック自体が Linux 向け）。
+exec 9> /run/cube-hosts.lock
+flock 9
+case "$op" in
+  add)
+    grep -qF "$marker" /etc/hosts || printf '%s\n' "$line" >> /etc/hosts ;;
+  remove)
+    tmp="$(mktemp)"
+    grep -vF "$marker" /etc/hosts > "$tmp"
+    cat "$tmp" > /etc/hosts   # inode を保つ（置換でなく上書き）
+    rm -f "$tmp" ;;
+  *)
+    echo "cube-hosts: unknown op: $op" >&2; exit 1 ;;
+esac
 ```
 
 ```bash
-export CUBE_POST_CREATE_CMD=/usr/local/bin/cube-hosts-add
+export CUBE_POST_CREATE_CMD="sudo /usr/local/bin/cube-hosts add"
+export CUBE_POST_DESTROY_CMD="sudo /usr/local/bin/cube-hosts remove"
 ```
 
 ## ドライバ差し替え

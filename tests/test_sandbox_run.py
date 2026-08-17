@@ -311,3 +311,201 @@ def test_remote_domain_does_not_override_metadata(monkeypatch, tmp_path):
 
     result = mod.run_untrusted("x", template_id="t", sandbox_factory=factory)
     assert result["isolation_level"] == "shared-kernel"
+
+
+# --- _shim_reachable（認証付き probe——stale port の別プロセス再利用を弾く） ----
+
+
+TOKEN = "e2b_" + "0" * 32
+
+
+def _write_conn_files(cube_dir, port, token=TOKEN):
+    cube_dir.mkdir(parents=True, exist_ok=True)
+    (cube_dir / "port").write_text(f"{port}\n")
+    (cube_dir / "token").write_text(token)
+
+
+def test_shim_reachable_rejects_raw_tcp_listener(tmp_path):
+    """TCP 接続を受けるだけの別プロセス（stale port 再利用）はシム稼働と誤判定しない。"""
+    import socket
+    import threading
+
+    mod = _load_module()
+    srv = socket.create_server(("127.0.0.1", 0))
+    port = srv.getsockname()[1]
+
+    def _accept_and_hold():
+        try:
+            conn, _ = srv.accept()
+            conn.recv(1024)  # 要求を読むが応答しない。
+        except OSError:
+            pass
+
+    threading.Thread(target=_accept_and_hold, daemon=True).start()
+    try:
+        _write_conn_files(tmp_path / ".cube", port)
+        assert mod._shim_reachable(tmp_path / ".cube") is False
+    finally:
+        srv.close()
+
+
+def test_shim_reachable_rejects_foreign_http_server(tmp_path):
+    """404 を返す一般 HTTP サーバー（E2B エラー形でない）もシムとは判定しない。"""
+    import http.server
+    import threading
+
+    mod = _load_module()
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            body = b"not found"
+            self.send_response(404)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    srv = http.server.HTTPServer(("127.0.0.1", 0), _Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        _write_conn_files(tmp_path / ".cube", srv.server_address[1])
+        assert mod._shim_reachable(tmp_path / ".cube") is False
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def _start_real_shim_server(token=TOKEN):
+    """実 ShimApp を制御プレーンだけ起動して (server, port, thread) を返す。"""
+    import threading
+
+    from subaco_shim.drivers.mock import MockDriver
+    from subaco_shim.isolation import IsolationLevel
+    from subaco_shim.server import ShimApp, make_server
+
+    app = ShimApp(
+        driver=MockDriver(isolation_level=IsolationLevel.VM_PER_CONTAINER),
+        api_key=token,
+        allow_shared_kernel=False,
+    )
+    app.data_port = 1
+    server = make_server(app, host="127.0.0.1", port=0, plane="control")
+    thread = threading.Thread(
+        target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True
+    )
+    thread.start()
+    return server, server.server_address[1], thread
+
+
+def test_shim_reachable_accepts_real_shim(tmp_path):
+    """本物のシム（認証が通った上での E2B 形 404）は稼働と判定する。"""
+    mod = _load_module()
+    server, port, thread = _start_real_shim_server()
+    try:
+        _write_conn_files(tmp_path / ".cube", port)
+        assert mod._shim_reachable(tmp_path / ".cube") is True
+        # トークン不一致（別プロジェクトのシム等）は稼働扱いしない（401 → False）。
+        _write_conn_files(tmp_path / ".cube", port, token="e2b_" + "f" * 32)
+        assert mod._shim_reachable(tmp_path / ".cube") is False
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+# --- 並行起動: 敗者は deadline まで勝者を待つ ---------------------------------
+
+
+def test_startup_loser_waits_for_winner(tmp_path, monkeypatch):
+    """起動プロセスが即終了（flock 敗者相当）しても、deadline 内に現れた勝者へ接続する。"""
+    import threading
+    import time
+
+    mod = _load_module()
+    cube = tmp_path / ".cube"
+    cube.mkdir()
+    monkeypatch.setenv("CUBE_SHIM_CMD", "false")  # 起動プロセスは即 exit 1（敗者を模擬）。
+
+    server, port, thread = _start_real_shim_server()
+
+    def _winner_appears():
+        time.sleep(3.0)  # 従来の固定 2 秒猶予より遅く出現する勝者。
+        _write_conn_files(cube, port)
+
+    threading.Thread(target=_winner_appears, daemon=True).start()
+    try:
+        start = time.monotonic()
+        mod._ensure_shim_running(cube, wait=30.0)  # 例外にならず勝者に接続できる。
+        elapsed = time.monotonic() - start
+        assert 2.5 < elapsed < 15
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+# --- post-destroy フック（破棄後の後始末——hosts エントリ削除等） --------------
+
+
+def test_post_destroy_runs_after_kill():
+    mod = _load_module()
+    order = []
+
+    class _KillOrderSandbox(_FakeSandbox):
+        def __exit__(self, *exc):
+            order.append("kill")
+            return False
+
+    def factory(*, template):
+        order.append("create")
+        return _KillOrderSandbox(template=template, isolation="vm-per-container")
+
+    result = mod.run_untrusted(
+        "x",
+        template_id="t",
+        sandbox_factory=factory,
+        post_destroy_hook=lambda sid: order.append(f"destroy:{sid}"),
+    )
+    assert result["ok"] is True
+    assert order == ["create", "kill", "destroy:fake-sbx-1"]
+
+
+def test_post_destroy_runs_even_when_post_create_fails():
+    """post-create 中断（部分実行）でも後始末は走る（hosts エントリの取り残し防止）。"""
+    mod = _load_module()
+    destroyed = []
+
+    def factory(*, template):
+        return _FakeSandbox(template=template, isolation="vm-per-container")
+
+    def bad_post_create(sb):
+        raise RuntimeError("hosts add failed")
+
+    result = mod.run_untrusted(
+        "x",
+        template_id="t",
+        sandbox_factory=factory,
+        post_create_hook=bad_post_create,
+        post_destroy_hook=destroyed.append,
+    )
+    assert result["ok"] is False
+    assert destroyed == ["fake-sbx-1"]
+
+
+def test_post_destroy_failure_does_not_break_result():
+    mod = _load_module()
+
+    def factory(*, template):
+        return _FakeSandbox(template=template, isolation="vm-per-container")
+
+    def bad_destroy(sid):
+        raise RuntimeError("cleanup failed")
+
+    result = mod.run_untrusted(
+        "x", template_id="t", sandbox_factory=factory, post_destroy_hook=bad_destroy
+    )
+    # 後始末の失敗はベストエフォート（結果を壊さない）。
+    assert result["ok"] is True
+    assert result["error"] is None

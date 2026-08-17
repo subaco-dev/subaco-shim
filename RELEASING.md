@@ -41,7 +41,8 @@ Publishing）・固定 requirements 生成までを行う。人手の手順は�
 
 ## 備考
 
-- 実行時依存はゼロのため requirements はヘッダのみになるのが正常（E2B SDK は test extra で、
-  配布物には含めない——遅延依存方針）。
+- 実行時依存は certifi のみ（`SSL_CERT_FILE` 用の certifi 結合 CA バンドル生成に必須——
+  シム証明書単体のバンドルは SDK 側プロセスの通常 HTTPS を壊すため）。requirements には
+  certifi が載るのが正常。E2B SDK は test extra で、配布物には含めない（遅延依存方針）。
 - E2B SDK 互換の再現範囲が確定する M2a-1 spike の結果次第で、`test` extra の
   `e2b-code-interpreter` を固定版に pin する（pyproject.toml の TODO）。

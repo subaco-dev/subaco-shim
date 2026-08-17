@@ -27,6 +27,7 @@ import platform
 import secrets
 import shutil
 import subprocess
+import threading
 from pathlib import Path
 
 from ..isolation import IsolationLevel
@@ -155,7 +156,11 @@ def check_rootless_prerequisites() -> list[str]:
 class PodmanExecutionHandle(ExecutionHandle):
     """``podman exec`` の Popen ハンドル。cancel はホスト側 exec プロセスを kill する。
 
-    クライアント TCP 切断 = 実行キャンセル（spike §1.3）の実装。exec プロセスの kill で
+    クライアント TCP 切断 = 実行キャンセル（spike §1.3）の実装。**実行開始時から
+    バックグラウンドスレッドが stdout/stderr をドレーンする**（``communicate`` が
+    pipe を読み続ける）——待ってから読む方式は pipe 容量超の大量出力でプロセスが
+    write ブロックしたまま終了できず、デッドロックする。ドライバ側タイムアウトも
+    同スレッドで実効化する（超過は kill → ExecTimeout）。exec プロセスの kill で
     コンテナ内プロセスまで確実に止まるかはバックエンド依存のため、実コンテナでの検証は
     podman nightly / 実機統合の対象（コンテナ自体は destroy 時に停止・削除される）。
     """
@@ -164,22 +169,51 @@ class PodmanExecutionHandle(ExecutionHandle):
         self._proc = proc
         self._timeout = timeout
         self._cancelled = False
+        self._timed_out = False
+        self._stdout = b""
+        self._stderr = b""
+        self._finished = threading.Event()
+        self._drainer = threading.Thread(target=self._drain, daemon=True)
+        self._drainer.start()
+
+    def _kill_group(self) -> None:
+        """exec プロセスを**プロセスグループごと** kill する。
+
+        ``proc.kill()`` は直接の子しか殺さないため、シェルパイプライン等の孫プロセスが
+        stdout の write 端を保持し続けると EOF が来ず drain が終わらない。exec_start は
+        ``start_new_session=True`` で起動しており、グループ全体を SIGKILL できる。
+        """
+        try:
+            os.killpg(self._proc.pid, 9)  # SIGKILL
+        except (ProcessLookupError, PermissionError, OSError):
+            self._proc.kill()
+
+    def _drain(self) -> None:
+        """pipe を読み切りつつ完了・タイムアウトを監視する（開始直後から常時実行）。"""
+        try:
+            self._stdout, self._stderr = self._proc.communicate(timeout=self._timeout)
+        except subprocess.TimeoutExpired:
+            self._timed_out = True
+            _log.warning("exec_timeout pid=%s timeout=%ss", self._proc.pid, self._timeout)
+            self._kill_group()
+            try:
+                self._stdout, self._stderr = self._proc.communicate(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                # killpg 後も何かが pipe を保持する異常系。読み残しは諦めて閉じる。
+                _log.error("exec_drain_stuck pid=%s", self._proc.pid)
+                for stream in (self._proc.stdout, self._proc.stderr):
+                    if stream is not None:
+                        stream.close()
+        finally:
+            self._finished.set()
 
     def done(self) -> bool:
-        return self._proc.poll() is not None
+        return self._finished.is_set()
 
     def result(self) -> Execution:
-        try:
-            stdout_b, stderr_b = self._proc.communicate(timeout=self._timeout)
-        except subprocess.TimeoutExpired:
-            self._proc.kill()
-            stdout_b, stderr_b = self._proc.communicate()
-            return Execution(
-                logs=Logs(),
-                error=ExecutionError(name="ExecTimeout", value=f"timeout={self._timeout}s"),
-            )
-        stdout = stdout_b.decode("utf-8", "replace")
-        stderr = stderr_b.decode("utf-8", "replace")
+        self._finished.wait()
+        stdout = self._stdout.decode("utf-8", "replace")
+        stderr = self._stderr.decode("utf-8", "replace")
         logs = Logs(
             stdout=stdout.splitlines() if stdout else [],
             stderr=stderr.splitlines() if stderr else [],
@@ -188,6 +222,11 @@ class PodmanExecutionHandle(ExecutionHandle):
             return Execution(
                 logs=logs,
                 error=ExecutionError(name="Cancelled", value="client disconnected"),
+            )
+        if self._timed_out:
+            return Execution(
+                logs=logs,
+                error=ExecutionError(name="ExecTimeout", value=f"timeout={self._timeout}s"),
             )
         if self._proc.returncode != 0:
             return Execution(
@@ -204,7 +243,7 @@ class PodmanExecutionHandle(ExecutionHandle):
             return
         self._cancelled = True
         _log.info("exec_cancelled pid=%s", self._proc.pid)
-        self._proc.kill()
+        self._kill_group()
 
 
 class PodmanDriver(Driver):
@@ -320,6 +359,8 @@ class PodmanDriver(Driver):
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
+                # kill をプロセスグループ全体へ届かせる（孫プロセスの pipe 保持対策）。
+                start_new_session=True,
             )
         except FileNotFoundError as exc:
             _log.error("driver_command_failed driver=podman reason=binary-not-found")

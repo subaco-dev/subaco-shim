@@ -131,6 +131,22 @@ def _write_bundle(certifi_ca: Path, cert: Path, bundle: Path) -> None:
     bundle.write_bytes(certifi_ca.read_bytes() + b"\n" + cert.read_bytes())
 
 
+def _bundle_is_current(bundle: Path, certifi_ca: Path, cert: Path) -> bool:
+    """バンドルが「現行 certifi の全内容 + 現行シム証明書」を含むかを**内容で**判定する。
+
+    mtime 比較では、旧版が生成した「シム証明書だけのバンドル」（certifi 任意依存時代の
+    成果物）が certifi ファイルより新しい場合に移行されない。内容包含の検査なら
+    旧成果物・certifi パッケージ更新・証明書再生成のすべてで正しく再生成に倒れる。
+    """
+    if not bundle.is_file():
+        return False
+    try:
+        data = bundle.read_bytes()
+    except OSError:
+        return False
+    return certifi_ca.read_bytes() in data and cert.read_bytes() in data
+
+
 def ensure_tls_material(paths: CubePaths) -> TlsMaterial:
     """``.cube/tls/`` の証明書・鍵・結合バンドルを用意する（再利用・失効前再生成）。"""
     paths.ensure_dir()
@@ -141,10 +157,7 @@ def ensure_tls_material(paths: CubePaths) -> TlsMaterial:
     if not (cert.is_file() and key.is_file()) or _cert_needs_renewal(cert):
         _generate(cert, key)
         _log.info("tls_cert_generated cert=%s days=%s", cert, _CERT_DAYS)
-    # バンドルは「シム証明書」と「certifi の CA ファイル」の両方より新しければ再利用
-    # （certifi パッケージ更新時も再生成して追随する）。
-    sources_mtime = max(cert.stat().st_mtime, certifi_ca.stat().st_mtime)
-    if not bundle.is_file() or bundle.stat().st_mtime < sources_mtime:
+    if not _bundle_is_current(bundle, certifi_ca, cert):
         _write_bundle(certifi_ca, cert, bundle)
         _log.info("ca_bundle_written bundle=%s certifi=%s", bundle, certifi_ca)
     return TlsMaterial(cert=cert, key=key, ca_bundle=bundle)
