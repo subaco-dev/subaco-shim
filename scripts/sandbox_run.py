@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""sandbox_run.py — 隔離環境でエージェント生成コードを検証する骨子。
+"""sandbox_run.py — 隔離環境でエージェント生成コードを検証する（M2a-4 本実装）。
 
 ============================================================================
 このファイルは **リファレンス（同梱コピー）** です。
 **正典（canonical）はテンプレート側（subaco の multi-agent テンプレート）** に置かれ、
-プロジェクトへ scaffold されます。shim リポジトリには、SDK 契約・構造化出力形状の
-参照実装として同梱しています。実運用のスクリプトはテンプレート側を編集してください。
+プロジェクトへ scaffold されます（テンプレート組み込みは M2b-3）。shim リポジトリには、
+SDK 契約・構造化出力形状の参照実装として同梱しています。
 ============================================================================
 
 役割（協業ループ）:
@@ -17,17 +17,26 @@
 呼び出し元エージェントが hive_remember で行う（単一ライター境界）。
 
 単一契約: 接続先が cube-shim / CubeSandbox / ホステッド E2B のいずれでも
-本コードは無改変で動く。接続先切替は `.envrc` の接続設定（`E2B_DOMAIN` 等）で行う。
+本コードは無改変で動く。接続先切替は `.envrc` の接続設定で行う
+（cube-shim は `E2B_API_URL` + `SSL_CERT_FILE`——spike 確定構成）。
 
-TODO: リトライ・タイムアウトの実値と方針は spike 確定の接続仕様に合わせる。
-TODO: 非 shim 接続先の隔離レベルは fail-closed（登録済みのみ microvm、未登録は unknown）。
+- **リトライ**: サンドボックス作成の接続確立失敗のみ再試行する（シムのオンデマンド起動
+  直後の race・アイドル終了からの再起動待ち）。実行済みコードの再送はしない
+  （/execute の再送は SDK 側でも起きない——spike §1.3。二重実行の副作用を避ける）。
+- **タイムアウト**: 実行タイムアウトは run_code に渡す。SDK はチャンク間無通信時間
+  （read タイムアウト）として扱う（spike §1.3）。既定は SDK の 300 秒。
+- **隔離レベル**: get_info の metadata（正典経路）から取得。無ければ **unknown
+  （fail-closed）** — 隔離保証なしとして扱う。登録済みリモートへの microvm 判定は
+  シム側の責務（設計書 §5.3。クライアントは申告しない）。
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import sys
+import time
 from collections.abc import Callable
 from typing import Any
 
@@ -35,6 +44,10 @@ from typing import Any
 ISOLATION_LEVEL_KEY = "isolation_level"
 # fail-closed の既定（metadata に無い＝隔離保証なしとして扱う）。
 UNKNOWN_ISOLATION = "unknown"
+
+# サンドボックス作成の再試行既定（回数と初回待機秒。待機は指数バックオフ）。
+DEFAULT_CREATE_RETRIES = 3
+DEFAULT_RETRY_WAIT = 0.2
 
 
 def _default_sandbox_factory() -> Callable[..., Any]:
@@ -47,11 +60,26 @@ def _default_sandbox_factory() -> Callable[..., Any]:
     return Sandbox.create
 
 
+def _is_retryable_create_error(exc: Exception) -> bool:
+    """作成時の例外が接続確立の失敗（再試行可能）か。
+
+    認証エラー・API エラー等の非一時的失敗は再試行しない。httpx は e2b SDK の依存として
+    存在する前提だが、遅延 import で不在でも壊れない。
+    """
+    if isinstance(exc, ConnectionError | TimeoutError | OSError):
+        return True
+    try:
+        import httpx  # type: ignore[import-not-found]
+    except ImportError:
+        return False
+    return isinstance(exc, httpx.ConnectError | httpx.ConnectTimeout | httpx.ReadTimeout)
+
+
 def _extract_isolation_level(info: Any) -> str:
     """get_info 返却から隔離レベル文字列を取り出す（無ければ unknown — fail-closed）。
 
-    E2B SDK の get_info 返却形状は接続先・バージョンで異なり得るため、metadata 相当を
-    寛容に探索する。TODO: 実際の返却型に合わせて確定する。
+    E2B SDK の get_info 返却（SandboxInfo）は metadata 属性を持つ。接続先・バージョン
+    差異に備えて dict 形も受ける。
     """
     metadata = getattr(info, "metadata", None)
     if metadata is None and isinstance(info, dict):
@@ -63,12 +91,48 @@ def _extract_isolation_level(info: Any) -> str:
     return UNKNOWN_ISOLATION
 
 
+def _execution_to_dict(execution: Any) -> dict[str, Any] | None:
+    """Execution を JSON 化可能な dict へ（実 e2b SDK は to_json のみ、骨子は to_dict を持つ）。"""
+    to_dict = getattr(execution, "to_dict", None)
+    if callable(to_dict):
+        return to_dict()
+    to_json = getattr(execution, "to_json", None)
+    if callable(to_json):
+        try:
+            parsed = json.loads(to_json())
+        except (TypeError, ValueError):
+            return None
+        return parsed if isinstance(parsed, dict) else None
+    return None
+
+
+def _create_with_retry(
+    factory: Callable[..., Any],
+    *,
+    template: str | None,
+    retries: int,
+    retry_wait: float,
+) -> Any:
+    """サンドボックスを作成する。接続確立の失敗のみ指数バックオフで再試行する。"""
+    attempt = 0
+    while True:
+        try:
+            return factory(template=template)
+        except Exception as exc:
+            if attempt >= retries or not _is_retryable_create_error(exc):
+                raise
+            time.sleep(retry_wait * (2**attempt))
+            attempt += 1
+
+
 def run_untrusted(
     code: str,
     *,
     template_id: str | None = None,
     sandbox_factory: Callable[..., Any] | None = None,
     timeout: float | None = None,
+    retries: int = DEFAULT_CREATE_RETRIES,
+    retry_wait: float = DEFAULT_RETRY_WAIT,
 ) -> dict[str, Any]:
     """コードを隔離環境で実行し、hive_remember に渡せる構造化 dict を返す。
 
@@ -76,7 +140,9 @@ def run_untrusted(
         code: 実行するコード（エージェント生成の未信頼コード）。
         template_id: OCI テンプレート参照（既定は環境変数 ``CUBE_TEMPLATE_ID``）。
         sandbox_factory: ``Sandbox.create`` 相当（テスト時に差替可。既定は e2b を遅延 import）。
-        timeout: 実行タイムアウト（TODO: 接続仕様に合わせて反映）。
+        timeout: 実行タイムアウト秒（run_code に渡す。None は SDK 既定 300 秒）。
+        retries: 作成時の接続失敗の最大再試行回数（実行の再送はしない）。
+        retry_wait: 再試行の初回待機秒（指数バックオフ）。
 
     返り値（構造化出力）:
         ``ok`` / ``text`` / ``isolation_level`` / ``template_id`` / ``execution`` / ``error``。
@@ -93,16 +159,17 @@ def run_untrusted(
         "error": None,
     }
 
-    # TODO: 接続失敗時のリトライループ（egress 遮断下のデータプレーン到達確認を含む）。
     try:
-        with factory(template=template) as sb:
-            execution = sb.run_code(code)
-            # run_code は Execution を返す。出力は .text、構造化は .to_json()。
+        with _create_with_retry(
+            factory, template=template, retries=retries, retry_wait=retry_wait
+        ) as sb:
+            # timeout=None は kwargs ごと省略し SDK 既定（300 秒）に委ねる。
+            run_kwargs = {} if timeout is None else {"timeout": timeout}
+            execution = sb.run_code(code, **run_kwargs)
+            # run_code は Execution を返す。出力は .text、構造化は .to_dict()/.to_json()。
             # str(Execution) は repr を返すため使わない。
             result["text"] = getattr(execution, "text", None)
-            to_dict = getattr(execution, "to_dict", None)
-            if callable(to_dict):
-                result["execution"] = to_dict()
+            result["execution"] = _execution_to_dict(execution)
             # 隔離レベルは get_info の metadata から取得（正典な返却経路）。
             info = sb.get_info()
             result[ISOLATION_LEVEL_KEY] = _extract_isolation_level(info)
@@ -114,9 +181,34 @@ def run_untrusted(
 
 def main(argv: list[str] | None = None) -> int:
     """コードを stdin（または引数）で受け取り、構造化 JSON を stdout に出力する。"""
-    argv = list(sys.argv[1:] if argv is None else argv)
-    code = argv[0] if argv else sys.stdin.read()
-    payload = run_untrusted(code)
+    parser = argparse.ArgumentParser(
+        prog="sandbox_run",
+        description="隔離環境でコードを検証し、構造化 JSON（隔離レベル込み）を出力する",
+    )
+    parser.add_argument("code", nargs="?", default=None, help="実行コード（省略時は stdin）")
+    parser.add_argument(
+        "--template",
+        default=None,
+        help="OCI テンプレート参照（既定は環境変数 CUBE_TEMPLATE_ID）",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=None,
+        help="実行タイムアウト秒（既定は SDK の 300 秒）",
+    )
+    parser.add_argument(
+        "--retries",
+        type=int,
+        default=DEFAULT_CREATE_RETRIES,
+        help="作成時の接続失敗の最大再試行回数",
+    )
+    args = parser.parse_args(argv)
+
+    code = args.code if args.code is not None else sys.stdin.read()
+    payload = run_untrusted(
+        code, template_id=args.template, timeout=args.timeout, retries=args.retries
+    )
     # hive_remember へそのまま渡せる構造化 JSON（記録は呼び出し元が行う）。
     print(json.dumps(payload, ensure_ascii=False))
     return 0 if payload["ok"] else 1

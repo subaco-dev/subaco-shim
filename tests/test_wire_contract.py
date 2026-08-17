@@ -154,3 +154,25 @@ def test_wrong_api_key_raises_authentication_error(live_shim, monkeypatch):
     monkeypatch.setenv("E2B_API_KEY", "e2b_" + "f" * 32)
     with pytest.raises(exceptions.AuthenticationException):
         Sandbox.create(template="tmpl-x")
+
+
+def test_sandbox_run_end_to_end(live_shim):
+    """sandbox_run.py（M2a-4）が実 SDK → シム経由で構造化出力を返すこと。"""
+    import importlib.util
+    from pathlib import Path
+
+    script = Path(__file__).resolve().parent.parent / "scripts" / "sandbox_run.py"
+    spec = importlib.util.spec_from_file_location("sandbox_run_e2e", script)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    result = mod.run_untrusted("print('hello')", template_id="tmpl-x")
+    assert result["ok"] is True
+    assert result["text"] == "print('hello')"  # MockDriver はコードをそのまま返す
+    assert result["isolation_level"] == "vm-per-container"
+    assert result["template_id"] == "tmpl-x"
+    # hive_remember にそのまま渡せる JSON 化可能な構造化出力。
+    assert isinstance(result["execution"], dict)
+    import json as _json
+
+    _json.dumps(result)

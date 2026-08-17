@@ -86,3 +86,77 @@ def test_run_untrusted_error_path():
     result = mod.run_untrusted("x", template_id="t", sandbox_factory=factory)
     assert result["ok"] is False
     assert "boom" in result["error"]
+
+
+# --- 作成リトライ（接続確立の失敗のみ再試行） --------------------------------
+
+
+def test_create_retries_on_connection_error():
+    mod = _load_module()
+    attempts = []
+
+    def factory(*, template):
+        attempts.append(1)
+        if len(attempts) < 3:
+            raise ConnectionRefusedError("shim not up yet")
+        return _FakeSandbox(template=template, isolation="vm-per-container")
+
+    result = mod.run_untrusted(
+        "x", template_id="t", sandbox_factory=factory, retries=3, retry_wait=0.01
+    )
+    assert result["ok"] is True
+    assert len(attempts) == 3
+
+
+def test_create_does_not_retry_non_connection_error():
+    mod = _load_module()
+    attempts = []
+
+    def factory(*, template):
+        attempts.append(1)
+        raise ValueError("auth-ish failure")  # 非一時的エラーは再試行しない。
+
+    result = mod.run_untrusted(
+        "x", template_id="t", sandbox_factory=factory, retries=3, retry_wait=0.01
+    )
+    assert result["ok"] is False
+    assert len(attempts) == 1
+
+
+def test_create_retry_exhaustion_returns_error():
+    mod = _load_module()
+    attempts = []
+
+    def factory(*, template):
+        attempts.append(1)
+        raise ConnectionRefusedError("never up")
+
+    result = mod.run_untrusted(
+        "x", template_id="t", sandbox_factory=factory, retries=2, retry_wait=0.01
+    )
+    assert result["ok"] is False
+    assert "ConnectionRefusedError" in result["error"]
+    assert len(attempts) == 3  # 初回 + 再試行 2 回
+
+
+# --- 実行タイムアウトの伝播 ---------------------------------------------------
+
+
+def test_timeout_passed_to_run_code():
+    mod = _load_module()
+    seen = {}
+
+    class _TimeoutSandbox(_FakeSandbox):
+        def run_code(self, code, **kwargs):
+            seen.update(kwargs)
+            return super().run_code(code)
+
+    def factory(*, template):
+        return _TimeoutSandbox(template=template, isolation="vm-per-container")
+
+    mod.run_untrusted("x", template_id="t", sandbox_factory=factory, timeout=42.0)
+    assert seen == {"timeout": 42.0}
+    # timeout 未指定は kwargs ごと省略（SDK 既定 300 秒に委ねる）。
+    seen.clear()
+    mod.run_untrusted("x", template_id="t", sandbox_factory=factory)
+    assert seen == {}
