@@ -65,8 +65,9 @@ REGISTERED_REMOTE_ISOLATION = "microvm-dedicated-kernel"
 # サンドボックス作成の再試行既定（回数と初回待機秒。待機は指数バックオフ）。
 DEFAULT_CREATE_RETRIES = 3
 DEFAULT_RETRY_WAIT = 0.2
-# シムのオンデマンド起動を待つ既定秒数。
-DEFAULT_SHIM_STARTUP_WAIT = 15.0
+# シムのオンデマンド起動を待つ既定秒数（コールドキャッシュ・遅い CI ランナーを考慮。
+# CUBE_SHIM_STARTUP_WAIT で上書き可）。
+DEFAULT_SHIM_STARTUP_WAIT = 60.0
 # post-create フックコマンドのタイムアウト秒。
 POST_CREATE_CMD_TIMEOUT = 30.0
 
@@ -132,12 +133,18 @@ def _shim_launcher() -> list[str] | None:
     return None
 
 
-def _ensure_shim_running(cube_dir: Path, *, wait: float = DEFAULT_SHIM_STARTUP_WAIT) -> None:
+def _ensure_shim_running(cube_dir: Path, *, wait: float | None = None) -> None:
     """シムをオンデマンド起動し、接続可能になるまで待つ（稼働中なら何もしない）。
 
     多重起動は flock（単一インスタンス）で 2 個目が即終了するため、起動の試行自体は
-    常に安全。診断出力は ``.cube/shim.log`` へ追記する。
+    常に安全。診断出力は ``.cube/shim.log`` へ追記する。起動プロセスが接続可能になる前に
+    終了した場合は待ち切らず即エラーにする（原因はログを参照）。
     """
+    if wait is None:
+        try:
+            wait = float(os.environ.get("CUBE_SHIM_STARTUP_WAIT", DEFAULT_SHIM_STARTUP_WAIT))
+        except ValueError:
+            wait = DEFAULT_SHIM_STARTUP_WAIT
     if _shim_reachable(cube_dir):
         return
     launcher = _shim_launcher()
@@ -147,8 +154,9 @@ def _ensure_shim_running(cube_dir: Path, *, wait: float = DEFAULT_SHIM_STARTUP_W
             "（CUBE_SHIM_CMD を設定するか cube-shim / subaco-shim を PATH に置いてください）"
         )
     cube_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    with (cube_dir / "shim.log").open("ab") as log:
-        subprocess.Popen(  # noqa: S603 - launcher はホスト側設定由来
+    log_path = cube_dir / "shim.log"
+    with log_path.open("ab") as log:
+        proc = subprocess.Popen(  # noqa: S603 - launcher はホスト側設定由来
             launcher,
             cwd=str(cube_dir.parent),
             stdin=subprocess.DEVNULL,
@@ -160,10 +168,30 @@ def _ensure_shim_running(cube_dir: Path, *, wait: float = DEFAULT_SHIM_STARTUP_W
     while time.monotonic() < deadline:
         if _shim_reachable(cube_dir):
             return
+        if proc.poll() is not None:
+            # 起動プロセスが終了。並行起動の敗者（flock で即終了）の可能性があるため、
+            # 少しだけ稼働側の出現を待ってからエラーにする。
+            grace = time.monotonic() + 2.0
+            while time.monotonic() < grace:
+                if _shim_reachable(cube_dir):
+                    return
+                time.sleep(0.1)
+            tail = _tail_text(log_path)
+            raise RuntimeError(
+                f"シム起動プロセスが接続可能になる前に終了しました"
+                f"（rc={proc.returncode}）。{log_path} 末尾:\n{tail}"
+            )
         time.sleep(0.1)
-    raise RuntimeError(
-        f"シムの起動を {wait} 秒待ちましたが接続できません（{cube_dir / 'shim.log'} を確認）"
-    )
+    raise RuntimeError(f"シムの起動を {wait} 秒待ちましたが接続できません（{log_path} を確認）")
+
+
+def _tail_text(path: Path, limit: int = 2000) -> str:
+    """ログ末尾を診断用に読む（読めなければプレースホルダ）。"""
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return "(ログを読めません)"
+    return data[-limit:].decode("utf-8", "replace") or "(空)"
 
 
 def _resolve_connection(cube_dir: Path) -> None:
