@@ -9,9 +9,13 @@ default:
 sync:
     uv sync --extra test --extra dev
 
-# テスト（stdlib のみで動く基盤層は外部依存なしで green）
+# テスト（stdlib のみで動く基盤層は外部依存なしで green。SDK 契約テストは skip される）
 test:
     uv run --with pytest pytest -q
+
+# ワイヤ契約テスト（実 E2B SDK・固定版。要 `just sync` 済み環境 + openssl）
+test-wire:
+    uv run pytest tests/test_wire_contract.py -q -rs
 
 # lint（ruff）
 lint:

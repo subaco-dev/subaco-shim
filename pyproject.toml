@@ -25,10 +25,12 @@ subaco-shim = "subaco_shim.cli:main"
 
 [project.optional-dependencies]
 # E2B SDK はテスト専用の extra（本体は SDK 非依存で動く。遅延依存方針）。
-# TODO: sandbox_run.py / SDK 互換テストで固定版を pin する。
+# ワイヤ契約は固定バージョンに対する実測（05_spike結果_E2B_ワイヤ.md）なので == で pin する。
+# SDK 更新時は spike レポートの前提（json=True 固定・SUPPORTED_SANDBOX_DOMAINS 等）を再確認する。
 test = [
   "pytest>=8",
-  "e2b-code-interpreter",
+  "e2b==2.30.0",
+  "e2b-code-interpreter==2.8.1",
 ]
 # lint/format 用。
 dev = [

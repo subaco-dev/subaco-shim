@@ -52,6 +52,28 @@ jobs:
       - name: pytest（mock ドライバ・stdlib 層は外部依存なしで green）
         run: uv run --with pytest pytest -q
 
+  wire-contract:
+    name: wire contract (${{ matrix.os }})
+    # 実 E2B SDK（固定バージョン pin——pyproject の test extra）をクライアントに使う
+    # ワイヤ契約 E2E（05_spike結果_E2B_ワイヤ.md §6-7）。*.sbx.localhost の名前解決に
+    # 依存するため、-rs で skip 理由を可視化する（ubuntu の解決可否は M2a の残実測項目）。
+    needs: lint
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: uv をセットアップ（Python 3.11）
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.11"
+      - name: 依存を同期（e2b SDK 固定版を含む test extra）
+        run: uv sync --extra test
+      - name: pytest（ワイヤ契約 E2E）
+        run: uv run pytest tests/test_wire_contract.py -q -rs
+
   podman-integration:
     name: podman integration (nightly)
     # nightly（schedule）と手動実行でのみ走らせる。PR/push では skip。

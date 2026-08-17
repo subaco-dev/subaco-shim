@@ -32,10 +32,12 @@ class EnvKeys:
 
     E2B_API_KEY = "E2B_API_KEY"  # .cube/token の内容（e2b_<hex32>）
     E2B_DOMAIN = "E2B_DOMAIN"  # 接続先ドメイン（既定はローカル shim）
-    E2B_API_URL = "E2B_API_URL"  # 制御プレーン URL（内部用途）
+    E2B_API_URL = "E2B_API_URL"  # 制御プレーン URL（http://127.0.0.1:{.cube/port} の平文）
+    SSL_CERT_FILE = "SSL_CERT_FILE"  # certifi+シム証明書の結合バンドル（.cube/tls/ca-bundle.pem）
     CUBE_TEMPLATE_ID = "CUBE_TEMPLATE_ID"  # digest 固定 OCI イメージ参照
     SUBACO_SHIM_LOG_LEVEL = "SUBACO_SHIM_LOG_LEVEL"  # 診断ログレベル
-    # TODO: E2B_SANDBOX_URL / E2B_DEBUG 等の接続 URL 系の最終形は spike で確定。
+    # E2B_SANDBOX_URL / E2B_DEBUG は不使用（spike 確定: 前者は run_code に効かず、
+    # 後者は create/kill が HTTP に出ない——05_spike結果 §2）。
 
 
 def env_str(key: str, default: str | None = None) -> str | None:
@@ -49,6 +51,10 @@ CUBE_DIR_NAME = ".cube"
 _PORT_FILE = "port"
 _TOKEN_FILE = "token"
 _WRITER_LOCK_FILE = "writer.lock"
+_TLS_DIR = "tls"
+_TLS_CERT_FILE = "cert.pem"
+_TLS_KEY_FILE = "key.pem"
+_TLS_CA_BUNDLE_FILE = "ca-bundle.pem"
 
 CUBE_DIR_MODE = 0o700
 CUBE_TOKEN_MODE = 0o600
@@ -58,16 +64,24 @@ CUBE_TOKEN_MODE = 0o600
 class CubePaths:
     """プロジェクト内 ``.cube/`` 配下のパス集合。
 
-    - ``root``        : ``.cube/``（0700）
-    - ``port``        : ``.cube/port``（シムの listen ポート）
-    - ``token``       : ``.cube/token``（E2B_API_KEY 相当、0600）
-    - ``writer_lock`` : ``.cube/writer.lock``（単一インスタンス flock。恒久・unlink しない）
+    - ``root``          : ``.cube/``（0700）
+    - ``port``          : ``.cube/port``（制御プレーンの listen ポート）
+    - ``token``         : ``.cube/token``（E2B_API_KEY 相当、0600）
+    - ``writer_lock``   : ``.cube/writer.lock``（単一インスタンス flock。恒久・unlink しない）
+    - ``tls_dir``       : ``.cube/tls/``（データプレーン TLS 資材。0700）
+    - ``tls_cert``      : ``.cube/tls/cert.pem``（``*.sbx.localhost`` ワイルドカード証明書）
+    - ``tls_key``       : ``.cube/tls/key.pem``（秘密鍵、0600）
+    - ``tls_ca_bundle`` : ``.cube/tls/ca-bundle.pem``（certifi 結合。SSL_CERT_FILE 用）
     """
 
     root: Path
     port: Path
     token: Path
     writer_lock: Path
+    tls_dir: Path
+    tls_cert: Path
+    tls_key: Path
+    tls_ca_bundle: Path
 
     @classmethod
     def resolve(cls, project_root: Path | str | None = None) -> CubePaths:
@@ -78,11 +92,16 @@ class CubePaths:
         """
         base = Path(project_root) if project_root is not None else Path.cwd()
         root = base / CUBE_DIR_NAME
+        tls_dir = root / _TLS_DIR
         return cls(
             root=root,
             port=root / _PORT_FILE,
             token=root / _TOKEN_FILE,
             writer_lock=root / _WRITER_LOCK_FILE,
+            tls_dir=tls_dir,
+            tls_cert=tls_dir / _TLS_CERT_FILE,
+            tls_key=tls_dir / _TLS_KEY_FILE,
+            tls_ca_bundle=tls_dir / _TLS_CA_BUNDLE_FILE,
         )
 
     def ensure_dir(self) -> None:

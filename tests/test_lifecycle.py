@@ -1,8 +1,10 @@
-"""lifecycle の単一インスタンス・ポート公開・トークン再利用・アイドル終了。"""
+"""lifecycle の単一インスタンス・ポート公開・トークン再利用・TLS データプレーン・アイドル終了。"""
 
 from __future__ import annotations
 
+import http.client
 import json
+import ssl
 import threading
 import urllib.request
 
@@ -36,13 +38,59 @@ def test_port_published_and_request_roundtrip(tmp_path):
     t.start()
     try:
         req = urllib.request.Request(
-            f"http://127.0.0.1:{shim.port}/v0/sandboxes",
-            data=json.dumps({"template_id": "t"}).encode(),
+            f"http://127.0.0.1:{shim.port}/sandboxes",
+            data=json.dumps({"templateID": "t"}).encode(),
             headers={API_KEY_HEADER: token, "Content-Type": "application/json"},
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=5) as resp:
             assert resp.status == 201
+            created = json.loads(resp.read())
+            # domain にはデータプレーン TLS の実ポートが埋め込まれる。
+            assert created["domain"] == f"sbx.localhost:{shim.data_port}"
+    finally:
+        shim.shutdown()
+        t.join(timeout=5)
+        shim.close()
+
+
+def test_data_plane_tls_roundtrip(tmp_path):
+    """TLS 検証の受け入れ条件: ワイルドカード証明書 + 結合バンドルで検証が通る
+    （名前解決に依存しないよう 127.0.0.1 へ接続し SNI をサブドメイン形で送る）。"""
+    paths = CubePaths.resolve(tmp_path)
+    shim = start_shim(paths=paths, config=_config(), driver=_vm_driver(), idle_timeout=0)
+    t = threading.Thread(target=shim.serve_forever, kwargs={"poll_interval": 0.1}, daemon=True)
+    t.start()
+    try:
+        # create でサンドボックスと envd トークンを得る（制御プレーン・平文）。
+        token = read_token(paths)
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{shim.port}/sandboxes",
+            data=json.dumps({"templateID": "t"}).encode(),
+            headers={API_KEY_HEADER: token, "Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            created = json.loads(resp.read())
+        sid, access = created["sandboxID"], created["envdAccessToken"]
+        hostname = f"{wire.ENVD_PORT}-{sid}.sbx.localhost"
+        # 結合バンドルを CA としてワイルドカード証明書の検証が通ること（SNI + check_hostname）。
+        ctx = ssl.create_default_context(cafile=str(shim.tls.ca_bundle))
+        conn = http.client.HTTPSConnection("127.0.0.1", shim.data_port, timeout=5, context=ctx)
+        # server_hostname（SNI・証明書検証名）はサブドメイン形にする。
+        conn._context = ctx  # HTTPSConnection は host を SNI に使うため接続を手動で張る。
+        import socket as _socket
+
+        raw = _socket.create_connection(("127.0.0.1", shim.data_port), timeout=5)
+        conn.sock = ctx.wrap_socket(raw, server_hostname=hostname)
+        conn.request(
+            "GET",
+            "/health",
+            headers={"Host": f"{hostname}:{shim.data_port}", wire.HEADER_ACCESS_TOKEN: access},
+        )
+        resp = conn.getresponse()
+        assert resp.status == 200
+        conn.close()
     finally:
         shim.shutdown()
         t.join(timeout=5)

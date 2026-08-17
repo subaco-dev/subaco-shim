@@ -1,0 +1,139 @@
+"""データプレーン TLS 資材（``*.sbx.localhost`` ワイルドカード証明書）の生成と再利用。
+
+spike §2(e) の確定方式:
+
+- **3 ラベルワイルドカード** ``*.sbx.localhost`` の自己署名証明書（OpenSSL は 2 ラベル
+  ``*.localhost`` を拒否する——実測 ``CERTIFICATE_VERIFY_FAILED``）。
+- 初回生成し ``.cube/tls/`` に保存（鍵 0600）。以後は再利用し、失効が近づいたら再生成する。
+- ``SSL_CERT_FILE`` は CA バンドル全体を**置き換える**ため、SDK 側プロセスの他の HTTPS を
+  壊さないよう **certifi + シム証明書の結合バンドル**（``ca-bundle.pem``）も生成する
+  （certifi が import できない環境ではシム証明書単体をバンドルとする）。
+
+証明書生成は ``openssl`` CLI に依存する（stdlib に証明書生成 API はない。Nix devShell /
+CI には openssl が入る前提。不在時は :class:`TlsSetupError` で明示エラー）。
+サーバー側の SSLContext は ALPN を広告しない（h2 を広告すると SDK の共有トランスポート
+``http2=True`` が HTTP/2 を要求してしまう——spike §2(e)-5）。
+"""
+
+from __future__ import annotations
+
+import shutil
+import ssl
+import subprocess
+from dataclasses import dataclass
+from pathlib import Path
+
+from .config import CUBE_TOKEN_MODE, CubePaths
+from .logging import get_logger
+from .protocol.wire import SANDBOX_DOMAIN_BASE
+
+_log = get_logger("tls")
+
+# 証明書の有効日数と、再生成を始める残余秒数（30 日を切ったら作り直す）。
+_CERT_DAYS = 825
+_RENEW_MARGIN_SECONDS = 30 * 24 * 3600
+
+_WILDCARD = f"*.{SANDBOX_DOMAIN_BASE}"
+
+
+class TlsSetupError(RuntimeError):
+    """TLS 資材を用意できない（openssl 不在・生成失敗）。"""
+
+
+@dataclass(frozen=True)
+class TlsMaterial:
+    """生成済み TLS 資材のパス集合。"""
+
+    cert: Path  # サーバー証明書（自己署名・*.sbx.localhost）
+    key: Path  # 秘密鍵（0600）
+    ca_bundle: Path  # certifi + cert の結合バンドル（SSL_CERT_FILE 用）
+
+    def server_context(self) -> ssl.SSLContext:
+        """データプレーンリスナー用の SSLContext を返す（ALPN h2 非広告）。"""
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(str(self.cert), str(self.key))
+        # set_alpn_protocols は呼ばない——ALPN 無応答で SDK は HTTP/1.1 にフォールバックする。
+        return ctx
+
+
+def _openssl() -> str:
+    exe = shutil.which("openssl")
+    if not exe:
+        raise TlsSetupError(
+            "openssl が見つかりません。データプレーン TLS 証明書の生成に必要です"
+            "（Nix devShell / パッケージマネージャで openssl を導入してください）"
+        )
+    return exe
+
+
+def _cert_needs_renewal(cert: Path) -> bool:
+    """証明書の失効が近いか（openssl x509 -checkend。判定不能時は再生成に倒す）。"""
+    try:
+        argv = [_openssl(), "x509", "-checkend", str(_RENEW_MARGIN_SECONDS), "-noout"]
+        proc = subprocess.run([*argv, "-in", str(cert)], capture_output=True)
+    except OSError:
+        return True
+    return proc.returncode != 0
+
+
+def _generate(cert: Path, key: Path) -> None:
+    """ワイルドカード自己署名証明書を生成する（spike と同一パラメータ・EC P-256）。"""
+    try:
+        subprocess.run(
+            [
+                _openssl(),
+                "req",
+                "-x509",
+                "-newkey",
+                "ec",
+                "-pkeyopt",
+                "ec_paramgen_curve:prime256v1",
+                "-keyout",
+                str(key),
+                "-out",
+                str(cert),
+                "-days",
+                str(_CERT_DAYS),
+                "-nodes",
+                "-subj",
+                f"/CN={_WILDCARD}",
+                "-addext",
+                f"subjectAltName=DNS:{_WILDCARD}",
+            ],
+            check=True,
+            capture_output=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        raise TlsSetupError(
+            f"TLS 証明書の生成に失敗しました: {exc.stderr.decode(errors='replace').strip()}"
+        ) from exc
+    key.chmod(CUBE_TOKEN_MODE)
+
+
+def _write_bundle(cert: Path, bundle: Path) -> None:
+    """certifi + シム証明書の結合バンドルを書く（certifi 不在時はシム証明書単体）。"""
+    parts: list[bytes] = []
+    try:
+        import certifi
+
+        parts.append(Path(certifi.where()).read_bytes())
+    except Exception:  # certifi は任意依存（shim 本体は依存ゼロ方針）。
+        _log.info("ca_bundle_without_certifi bundle=%s", bundle)
+    parts.append(cert.read_bytes())
+    bundle.write_bytes(b"\n".join(parts))
+
+
+def ensure_tls_material(paths: CubePaths) -> TlsMaterial:
+    """``.cube/tls/`` の証明書・鍵・結合バンドルを用意する（再利用・失効前再生成）。"""
+    paths.ensure_dir()
+    paths.tls_dir.mkdir(mode=0o700, exist_ok=True)
+    cert, key, bundle = paths.tls_cert, paths.tls_key, paths.tls_ca_bundle
+
+    if not (cert.is_file() and key.is_file()) or _cert_needs_renewal(cert):
+        _generate(cert, key)
+        _log.info("tls_cert_generated cert=%s days=%s", cert, _CERT_DAYS)
+    # バンドルは証明書より新しければ再利用（certifi 更新の追随は再生成時に行われる）。
+    if not bundle.is_file() or bundle.stat().st_mtime < cert.stat().st_mtime:
+        _write_bundle(cert, bundle)
+        _log.info("ca_bundle_written bundle=%s", bundle)
+    return TlsMaterial(cert=cert, key=key, ca_bundle=bundle)

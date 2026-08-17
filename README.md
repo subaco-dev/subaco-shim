@@ -7,25 +7,38 @@ E2B API 互換のローカル実行シム。エージェント生成コードを
 - 言語: Python 3.11+ / ライセンス: Apache-2.0
 - エントリポイント: `subaco-shim = subaco_shim.cli:main`（`subaco-shim serve` で起動）
 
-## v0 の E2B カバレッジ（5 系統）
+## E2B ワイヤ互換（5 系統・SDK 無改造）
 
-SDK（`e2b-code-interpreter`）を無改修で使えるよう、**制御プレーン**（`X-API-KEY`）と
-**envd データプレーン**（サンドボックス単位の `X-Access-Token`）の 2 面で 5 系統の操作を提供する。
-v0 は 127.0.0.1 上の薄い HTTP/JSON API に写像した骨子で、
-E2B ワイヤ（Connect RPC / サブドメイン多重化 / TLS）の忠実再現は将来の spike で確定する。
+固定バージョンの実 SDK（`e2b==2.30.0` / `e2b-code-interpreter==2.8.1`）が**無改造・root 不要・
+外部 DNS 不要**で動作するワイヤ面を提供する（実測仕様は
+`docs/00-memo/05_spike結果_E2B_ワイヤ.md`、判定 full-fidelity-feasible）。
 
-| 操作 | プレーン | 認証ヘッダ | v0 ローカルルート |
+- **制御プレーン**（平文 HTTP・`E2B_API_URL=http://127.0.0.1:{.cube/port}`・`X-API-KEY`）:
+  `POST /sandboxes`(201)・`GET /sandboxes/{id}`(200)・`DELETE /sandboxes/{id}`(204/404)。
+  エラーは `{"code", "message"}` 形。
+- **データプレーン**（単一 TLS リスナー・`X-Access-Token`）: create 応答の
+  `domain: "sbx.localhost:{TLS ポート}"` により、SDK の全データプレーン URL が
+  `https://{port}-{sandbox_id}.sbx.localhost:{TLS ポート}` に集約される。Host ヘッダの
+  `{port}-{sandbox_id}` で多重化し、`49983` 面は `GET/POST /files`・`GET /health`、
+  `49999` 面は `POST /execute`（chunked HTTP/1.1・改行区切り JSON ストリーム）を受ける。
+- TLS は `.cube/tls/` の `*.sbx.localhost` ワイルドカード自己署名証明書（初回生成・再利用・
+  ALPN h2 非広告）。SDK 側は `SSL_CERT_FILE={.cube/tls/ca-bundle.pem}`（certifi 結合バンドル）で
+  検証する。`E2B_DEBUG` / `E2B_SANDBOX_URL` は不使用（spike で方式不成立を実測）。
+
+| 操作 | プレーン | 認証ヘッダ | ワイヤ |
 |---|---|---|---|
-| create | 制御 | `X-API-KEY` | `POST /v0/sandboxes` |
-| get_info | 制御 | `X-API-KEY` | `GET /v0/sandboxes/{id}` |
-| destroy | 制御 | `X-API-KEY` | `DELETE /v0/sandboxes/{id}` |
-| run_code | envd | `X-Access-Token` | `POST /v0/sandboxes/{id}/run_code` |
-| files write | envd | `X-Access-Token` | `POST /v0/sandboxes/{id}/files?path=` |
-| files read | envd | `X-Access-Token` | `GET /v0/sandboxes/{id}/files?path=` |
+| create | 制御 | `X-API-KEY` | `POST /sandboxes` → 201 + `{sandboxID, clientID, templateID, envdVersion, envdAccessToken, domain}` |
+| get_info | 制御 | `X-API-KEY` | `GET /sandboxes/{id}` → 200 + SandboxDetail（必須 10 キー + metadata） |
+| destroy | 制御 | `X-API-KEY` | `DELETE /sandboxes/{id}` → 204（`kill()==True`）/ 404（False） |
+| run_code | データ | `X-Access-Token` | 49999 面 `POST /execute` → chunked JSON lines |
+| files write | データ | `X-Access-Token` | 49983 面 `POST /files?path=`（multipart）→ 非空 JSON 配列 |
+| files read | データ | `X-Access-Token` | 49983 面 `GET /files?path=` → 生バイト |
 
-- create 応答は `envd_access_token` を返し、SDK は envd 経路で `X-Access-Token` として自動付与する。
+- create 応答の `envdAccessToken` を SDK が以後の全データプレーン要求に `X-Access-Token` として
+  自動付与する（サンドボックスごとに一意発行 = 多重化キーを兼ねる）。
 - なし／不一致は**両プレーンとも 401**（`tests/test_access_control.py` が実ソケットで検証）。
-- envd ポートの正典値は `envd=49983` / `run_code=49999`（`subaco_shim.protocol.wire`）。
+- 実 SDK をクライアントに使うワイヤ契約 E2E は `tests/test_wire_contract.py`（`just test-wire`。
+  CI の wire-contract ジョブが ubuntu + macos で実行）。
 
 ## 隔離モデルと default-deny
 
@@ -83,13 +96,43 @@ cube-<id>`）で実行する。`--network=none` は使わない（ホスト → 
 
 ```
 <project>/.cube/          # 0700, gitignore（.hive とは別ディレクトリ）
-├── port                  # シムの listen ポート（動的割当を書き出す）
+├── port                  # 制御プレーンの listen ポート（動的割当を書き出す）
 ├── token                 # E2B_API_KEY 相当（e2b_<hex32>, 0600, 再起動で再利用）
-└── writer.lock           # 単一インスタンス flock（恒久・unlink しない）
+├── writer.lock           # 単一インスタンス flock（恒久・unlink しない）
+└── tls/                  # データプレーン TLS 資材（0700。初回生成・再利用）
+    ├── cert.pem          # *.sbx.localhost ワイルドカード自己署名証明書
+    ├── key.pem           # 秘密鍵（0600）
+    └── ca-bundle.pem     # certifi + cert の結合バンドル（SSL_CERT_FILE 用）
 ```
 
-単一インスタンスは `.cube/writer.lock` の `flock`（プロジェクト単位に 1 プロセス）で保証する。
-無操作が閾値（既定 300 秒）を超えると自動終了する（`--idle-timeout` で調整）。
+データプレーン TLS の実ポートはファイルには書かず、create 応答の `domain` に埋め込んで
+SDK へ伝える。単一インスタンスは `.cube/writer.lock` の `flock`（プロジェクト単位に
+1 プロセス）で保証する。無操作が閾値（既定 300 秒）を超えると自動終了する
+（`--idle-timeout` で調整）。
+
+### `.envrc` 配線（テンプレート側・M2b-3）
+
+```bash
+# いずれもファイル存在時のみ export し、呼び出し側は実行時に読み直す。
+export E2B_API_KEY="$(cat .cube/token)"
+export E2B_API_URL="http://127.0.0.1:$(cat .cube/port)"
+export SSL_CERT_FILE="$PWD/.cube/tls/ca-bundle.pem"
+```
+
+## runbook: Linux の `*.sbx.localhost` 名前解決フォールバック
+
+データプレーン URL の解決は OS の `*.localhost` 処理に依存する。macOS と
+systemd-resolved 稼働の Linux は 127.0.0.1 へ解決される（実測）。**コンテナ・WSL2 等の
+systemd-resolved 非稼働環境では解決されない**（Ubuntu 24.04 コンテナで実測）。シムは起動時に
+解決可否を診断し、不解決なら `subdomain_resolution_failed` を warning で出す。
+
+フォールバックは 2 条件を別々に満たす（TLS 検証はワイルドカード証明書 + `SSL_CERT_FILE` で
+名前解決手段によらず成立する。直すのは名前解決のみ）:
+
+1. **名前解決**: サンドボックス作成後、`/etc/hosts` に per-sandbox エントリを追記する
+   （root 権限が必要。例: `127.0.0.1 49983-<sandbox_id>.sbx.localhost
+   49999-<sandbox_id>.sbx.localhost`）。
+2. **TLS 検証**: 追加作業不要（`ca-bundle.pem` を `SSL_CERT_FILE` に指す既定構成のまま）。
 
 ## ドライバ差し替え
 
@@ -139,15 +182,17 @@ NixOS では対象外（`/etc/NIXOS` 検出でスキップ）。
 ## 開発
 
 ```bash
-just test    # pytest（stdlib 層は外部依存なしで green）
-just lint    # ruff check
-just fmt     # ruff format
-just compile # py_compile のみ（オフライン確認）
+just test      # pytest（stdlib 層は外部依存なしで green。SDK 契約テストは skip）
+just test-wire # ワイヤ契約 E2E（実 E2B SDK 固定版。要 `just sync` + openssl）
+just lint      # ruff check
+just fmt       # ruff format
+just compile   # py_compile のみ（オフライン確認）
 ```
 
 `uv`（`uv run --with pytest pytest -q`）でオフライン実行できる。Python 3.11+ 必須
 （`tomllib` / 型構文）。CI（`.github/workflows/ci.yml`）は ubuntu + macos マトリクスで
-lint + test（mock ドライバ）を回し、podman 実コンテナ統合は nightly（`shutil.which` skip）。
+lint + test（mock ドライバ）+ wire-contract（実 SDK 契約 E2E）を回し、
+podman 実コンテナ統合は nightly（`shutil.which` skip）。
 
 ## セキュリティ境界（要点）
 

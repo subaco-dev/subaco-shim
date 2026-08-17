@@ -98,6 +98,8 @@ def _cmd_status(args: argparse.Namespace) -> int:
         f"cube_dir: {paths.root}",
         f"token: {_mask_token(read_token(paths))}",
         f"port: {read_port(paths) if read_port(paths) is not None else '(none)'}",
+        f"tls_cert: {paths.tls_cert if paths.tls_cert.is_file() else '(not generated)'}",
+        f"ca_bundle: {paths.tls_ca_bundle if paths.tls_ca_bundle.is_file() else '(not generated)'}",
         f"running: {running}",
         f"env.{EnvKeys.E2B_DOMAIN}: {env_str(EnvKeys.E2B_DOMAIN) or '(unset)'}",
         f"env.{EnvKeys.CUBE_TEMPLATE_ID}: {env_str(EnvKeys.CUBE_TEMPLATE_ID) or '(unset)'}",

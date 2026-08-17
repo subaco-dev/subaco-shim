@@ -330,13 +330,15 @@ dev = [
     { name = "ruff" },
 ]
 test = [
+    { name = "e2b" },
     { name = "e2b-code-interpreter" },
     { name = "pytest" },
 ]
 
 [package.metadata]
 requires-dist = [
-    { name = "e2b-code-interpreter", marker = "extra == 'test'" },
+    { name = "e2b", marker = "extra == 'test'", specifier = "==2.30.0" },
+    { name = "e2b-code-interpreter", marker = "extra == 'test'", specifier = "==2.8.1" },
     { name = "pytest", marker = "extra == 'test'", specifier = ">=8" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.6" },
 ]
