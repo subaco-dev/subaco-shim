@@ -25,6 +25,7 @@ from __future__ import annotations
 import math
 import os
 import platform
+import re
 import secrets
 import shutil
 import subprocess
@@ -107,25 +108,30 @@ def resolve_exec_max_output() -> int | None:
     return None if val <= 0 else val
 
 
-def _split_lines_bounded(text: str, max_lines: int = _MAX_OUTPUT_LINES) -> list[str]:
-    """行分割の後処理メモリ境界: 上限を超えた残りは 1 要素に集約する。
+# str.splitlines() が行境界として扱う文字の集合（\r\n は 1 境界として先に照合）。
+_LINE_BOUNDARY = re.compile("\r\n|[\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029]")
 
-    残り全体は 1 つの str のまま保持するため（要素あたりのオーバーヘッドが掛からず）
-    メモリはバイト上限と同じオーダーに収まる。データは失わない。
+
+def _split_lines_bounded(text: str, max_lines: int = _MAX_OUTPUT_LINES) -> list[str]:
+    """splitlines() の行分割に後処理メモリ境界を置く: 上限を超えた残りは 1 要素に集約する。
+
+    上限内の結果は ``str.splitlines()`` と同一（LF だけでなく CR/CRLF/VT/FF/FS/GS/RS/
+    NEL/LS/PS の全境界を扱う）。境界は finditer で遅延走査するため巨大な行リストを
+    実体化せず、残り全体は 1 つの str のまま保持する（要素あたりのオーバーヘッドが
+    掛からず、メモリはバイト上限と同じオーダーに収まる）。データは失わない。
     """
     if not text:
         return []
-    parts = text.split("\n", max_lines)
-    if len(parts) <= max_lines:
-        # 全行が上限内。末尾改行由来の空要素を除き splitlines() 相当に整える。
-        if parts and parts[-1] == "":
-            parts.pop()
-        return parts
-    head = parts[:max_lines]
-    rest = parts[max_lines]
-    if rest:
-        head.append(rest)  # 集約された残り（改行を含む 1 要素）。
-    return head
+    lines: list[str] = []
+    pos = 0
+    for m in _LINE_BOUNDARY.finditer(text):
+        if len(lines) >= max_lines:
+            break
+        lines.append(text[pos : m.start()])
+        pos = m.end()
+    if pos < len(text):
+        lines.append(text[pos:])  # 最終行（終端なし）または集約された残り（境界を含む）。
+    return lines
 
 
 # 「env から解決」と「明示 None（無期限/無制限）」を区別するための番兵。
@@ -315,6 +321,31 @@ class PodmanExecutionHandle(ExecutionHandle):
         except (ProcessLookupError, PermissionError, OSError):
             self._proc.kill()
 
+    def _group_alive(self) -> bool:
+        """プロセスグループに生存メンバーがいるか（``killpg(pgid, 0)`` の存在確認）。
+
+        exec_start は ``start_new_session=True`` で起動するため pgid == 親 pid。親は
+        wait() で reap 済みなので、ここで見えるのは親が残した子孫だけ。ProcessLookupError
+        以外（PermissionError 等）は「存在するが送れない」なので生存扱い（保守側）。
+        """
+        try:
+            os.killpg(self._proc.pid, 0)
+        except ProcessLookupError:
+            return False
+        except OSError:
+            return True
+        return True
+
+    def _kill_group_and_wait(self, timeout: float) -> bool:
+        """グループを SIGKILL し、全メンバーの消滅（PID 消失）まで待つ。消えれば True。"""
+        self._kill_group()
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if not self._group_alive():
+                return True
+            time.sleep(0.01)
+        return not self._group_alive()
+
     def _join_readers(self, timeout: float) -> bool:
         """reader の終了（= 両 pipe の EOF）を待つ。全員終われば True。"""
         deadline = time.monotonic() + timeout
@@ -331,13 +362,23 @@ class PodmanExecutionHandle(ExecutionHandle):
             _log.warning("exec_timeout pid=%s timeout=%ss", self._proc.pid, self._timeout)
             self._kill_group()
             self._proc.wait()
-        # 親終了後、両 pipe の EOF（= write 端の全クローズ）を待つ。EOF が来ない =
-        # 親が残した子孫プロセスが write 端を保持している。放置すると出力が欠けたまま
-        # 成功扱いになり、子孫はハード上限も受けずに走り続けるため、プロセスグループを
-        # 停止して**成功扱いにしない**（result は OrphanedProcesses エラー）。
-        if not self._join_readers(timeout=2.0):
+        # 親終了後の子孫残存は**プロセスグループの生存**で検出する。pipe の EOF は
+        # 「write 端を保持する子孫がいない」ことしか示さず、stdio を /dev/null 等へ
+        # 向けた子孫は EOF では見えない。残存子孫は出力欠落・ハード上限回避の経路
+        # なのでグループごと停止し（PID 消滅まで確認）、**成功扱いにしない**
+        # （result は OrphanedProcesses エラー）。子孫が無ければ killpg(0) が即
+        # ProcessLookupError になるだけで、正常系のコストはゼロ。
+        if self._group_alive():
             self._orphaned = True
             _log.warning("exec_orphaned_processes pid=%s — killing process group", self._proc.pid)
+            if not self._kill_group_and_wait(timeout=5.0):
+                _log.error("exec_group_kill_stuck pid=%s", self._proc.pid)
+        # 両 pipe の EOF（= write 端の全クローズ）を待って出力を確定する。グループ停止後
+        # は速やかに EOF が来るはず。来ない場合も子孫残存（グループ外へ逃れた等）として
+        # 扱い、成功にしない。
+        if not self._join_readers(timeout=2.0):
+            self._orphaned = True
+            _log.warning("exec_drain_not_eof pid=%s — killing process group", self._proc.pid)
             self._kill_group()
             if not self._join_readers(timeout=5.0):
                 # killpg 後も残る異常系（daemon スレッドのため後始末はプロセス終了時）。

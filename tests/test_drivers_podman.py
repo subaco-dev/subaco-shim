@@ -197,6 +197,41 @@ def test_exec_orphaned_children_killed_and_not_success(tmp_path):
     assert execution.error.name == "OrphanedProcesses"
 
 
+def test_exec_orphaned_devnull_children_detected_and_killed(tmp_path):
+    """stdio を /dev/null へ向けた子孫（pipe 非保持）も検出・停止する。
+
+    レビュー指摘の再現: pipe の EOF は「write 端を保持する子孫がいない」ことしか
+    示さないため、stdio を切り離した子孫は 0.04 秒で error=None（成功）のまま
+    生き残った。プロセスグループの生存確認で検出し、PID 消滅まで停止する。
+    """
+    import os
+    import time
+
+    pidfile = tmp_path / "child.pid"
+    binary = _fake_podman(
+        tmp_path,
+        f'sleep 30 >/dev/null 2>&1 </dev/null &\necho $! > "{pidfile}"\nexit 0',
+    )
+    d = PodmanDriver(binary=binary, exec_timeout=60.0)
+    start = time.monotonic()
+    execution = d.exec("sbx1", "code")
+    elapsed = time.monotonic() - start
+    assert elapsed < 15, f"子孫の sleep 30 を待ってはならない: {elapsed:.1f}s"
+    assert execution.error is not None, "子孫が残った実行を成功扱いにしてはならない"
+    assert execution.error.name == "OrphanedProcesses"
+    # kill シグナルの送付だけでなく、子孫 PID が実際に消滅していること。
+    pid = int(pidfile.read_text().strip())
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.05)
+    else:
+        pytest.fail(f"orphaned child pid={pid} still alive")
+
+
 def test_exec_line_splitting_is_bounded(tmp_path):
     """バイト上限通過後の行分割にも上限がある（短い行の大量分割による再膨張の防止）。
 
@@ -226,6 +261,35 @@ def test_split_lines_bounded_semantics():
     # 上限超過は先頭 N 行 + 残り 1 要素（データは失わない）。
     bounded = _split_lines_bounded("1\n2\n3\n4\n5\n", max_lines=2)
     assert bounded == ["1", "2", "3\n4\n5\n"]
+
+
+def test_split_lines_bounded_matches_splitlines():
+    """上限内の結果は str.splitlines() と**同一**（LF 以外の全境界を含む）。
+
+    レビュー指摘の再現: LF 限定の分割では "a\\r\\nb\\r\\n" が従来の ["a", "b"] でなく
+    ["a\\r", "b\\r"] になった。CR/CRLF/VT/FF/FS/GS/RS/NEL/LS/PS を splitlines() と
+    同じ境界として扱う。
+    """
+    from subaco_shim.drivers.podman import _split_lines_bounded
+
+    samples = [
+        "a\r\nb\r\n",
+        "a\rb",
+        "a\vb\fc",
+        "a\x1cb\x1dc\x1ed",
+        "a\x85b",
+        "a\u2028b\u2029c",
+        "\n\n",
+        "no newline",
+        "trailing\n",
+        "\r\n",
+        "\r\r\n\n",
+        "mixed\r\nof\rall\n\vkinds\u2028end\u2029",
+    ]
+    for s in samples:
+        assert _split_lines_bounded(s, max_lines=100) == s.splitlines(), repr(s)
+    # 上限超過時も境界の扱いは同一（CRLF は 1 境界。残りは境界ごと 1 要素に集約）。
+    assert _split_lines_bounded("a\r\nb\r\nc\r\nd\r\n", max_lines=2) == ["a", "b", "c\r\nd\r\n"]
 
 
 def test_env_limit_values_reject_non_finite_and_fractional(tmp_path, monkeypatch):
