@@ -39,7 +39,7 @@ def test_each_sandbox_gets_distinct_internal_network():
 
     # egress なし内部ネットワークとして作成（--internal を使い、--network=none は使わない）。
     for net in (net_a, net_b):
-        assert [C.PODMAN, "network", "create", "--internal", net] in d.commands
+        assert [C.PODMAN, "network", "create", "--internal", "--disable-dns", net] in d.commands
 
 
 def test_no_none_network_and_no_host_mount():
@@ -71,7 +71,8 @@ def test_network_created_before_container_start():
     d = MockDriver()
     sid = d.create(template_id="tmpl").sandbox_id
     net = C.network_name(sid)
-    create_idx = d.commands.index([C.PODMAN, "network", "create", "--internal", net])
+    create_argv = [C.PODMAN, "network", "create", "--internal", "--disable-dns", net]
+    create_idx = d.commands.index(create_argv)
     run_idx = d.commands.index(_run_argv_for(d, net)[0])
     assert create_idx < run_idx
 

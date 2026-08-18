@@ -50,9 +50,14 @@ def container_name(sandbox_id: str) -> str:
 def create_network_argv(name: str) -> list[str]:
     """egress なし内部ネットワークを作成する argv（``--internal``。``--network=none`` は使わない）。
 
+    ``--disable-dns`` を必ず付ける（最小機能）: サンドボックスは自分専用ネットワークに
+    1 コンテナだけで載る設計（サンドボックス間相互遮断）のため、コンテナ名 DNS は
+    解決対象が存在せず不要。DNS を切ることで per-network の aardvark-dns デーモン
+    という不要な可動部そのものを起動させない（デーモン数と障害面の削減）。
+
     TODO: ネットワーク間分離の enforce に ``-o isolate=true`` を付すかは spike で確定。
     """
-    return ["network", "create", "--internal", name]
+    return ["network", "create", "--internal", "--disable-dns", name]
 
 
 def remove_network_argv(name: str) -> list[str]:

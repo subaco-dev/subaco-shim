@@ -4,10 +4,14 @@ podman を **サブプロセス**として呼ぶ薄いドライバ。隔離レ�
 （共有カーネル層。default-deny ではホスト管理者の ``allow_shared_kernel`` オプトイン時のみ
 実行が許可される）。
 
-**podman 検出**: 非 NixOS Linux の rootless 実行はホスト側前提（``/etc/subuid``・
-``/etc/subgid``・setuid 付き ``newuidmap``）を要し、nixpkgs 版配布だけでは完結しない。
-そのため cube-shim は**システムインストール済み podman を優先検出**し、無ければ PATH 上の
-podman を使う。前提が欠ける場合は :class:`PodmanPreflightError` に runbook を添えて送出する。
+**podman 検出**: **PATH 上の podman を優先検出**し、無ければシステム既知パス
+（/usr/bin 等）へフォールバックする。PATH 優先なのは、rootless のコンテナストレージは
+「環境が普段使う podman」＝ PATH 解決される個体が所有するためで、別の個体を選ぶと
+複数インストール環境（例: GitHub ランナーの /usr/local 同梱 5.x + apt の 4.9）で
+バージョン混在のストレージアクセスになり ``podman run`` がハングする（CI 実測）。
+非 NixOS Linux の rootless 前提（``/etc/subuid``・``/etc/subgid``・setuid 付き
+``newuidmap``）はバイナリの出自と独立にホスト側で必要で、欠ける場合は
+:class:`PodmanPreflightError` に runbook を添えて送出する。
 
 **ネットワークとマウント**: サンドボックスごとに ``podman network create --internal
 cube-<id>`` で egress なし内部ネットワークを個別作成し、コンテナをそれに接続する。
@@ -41,7 +45,7 @@ from .base import Driver, ExecutionHandle
 
 _log = get_logger("drivers.podman")
 
-# システムインストール済み podman の優先探索パス（システム podman を優先検出）。
+# PATH に podman が無い場合のフォールバック探索パス（PATH 優先——_detect_binary 参照）。
 _SYSTEM_PODMAN_PATHS = ("/usr/bin/podman", "/usr/local/bin/podman", "/opt/podman/bin/podman")
 
 # 制御系 podman コマンド（network / run / stop / rm / put / get）のタイムアウト（秒）。
@@ -171,11 +175,29 @@ class PodmanCommandError(RuntimeError):
 
 
 def _detect_binary() -> str | None:
-    """システム podman を優先し、無ければ PATH 上の podman を返す。無ければ None。"""
+    """PATH 上の podman を優先し、無ければシステム既知パスへフォールバックする。
+
+    **PATH 優先の理由（CI 実測で確定した障害の再発防止）**: rootless のコンテナ
+    ストレージ（``~/.local/share/containers``）は「環境が普段使う podman」＝ PATH 解決
+    される個体が所有・初期化する。複数の podman が併存する環境（GitHub ランナーは
+    /usr/local/bin に 5.x を同梱し、apt は /usr/bin に 4.9 を入れる）で PATH と別の
+    個体を選ぶと、**別バージョンが同一ストレージを跨いで操作し ``podman run`` が
+    futex 待ちのまま無出力でハングする**（バージョン混在のロック/DB 非互換。
+    stderr も出ないため 120s タイムアウトまで沈黙する）。ハードコードパスの優先は
+    この混在を構造的に招くため、フォールバック専用とする。
+    """
+    which = shutil.which("podman")
+    if which is not None:
+        for cand in _SYSTEM_PODMAN_PATHS:
+            if cand != which and os.path.isfile(cand) and os.access(cand, os.X_OK):
+                # PATH 優先＝ストレージ所有者と一致させる（docstring 参照）。
+                _log.info("mixed_podman_installs detected=%s using=%s", cand, which)
+                break
+        return which
     for cand in _SYSTEM_PODMAN_PATHS:
         if os.path.isfile(cand) and os.access(cand, os.X_OK):
             return cand
-    return shutil.which("podman")
+    return None
 
 
 def _is_nixos() -> bool:
@@ -471,7 +493,7 @@ class PodmanDriver(Driver):
 
     @classmethod
     def available(cls) -> bool:
-        """podman バイナリを検出できるか（システム優先検出）。"""
+        """podman バイナリを検出できるか（PATH 優先検出——_detect_binary 参照）。"""
         return _detect_binary() is not None
 
     def _ensure_ready(self) -> str:

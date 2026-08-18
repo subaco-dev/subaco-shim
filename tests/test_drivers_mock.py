@@ -27,7 +27,7 @@ def test_create_records_per_sandbox_network_and_isolation():
     assert net in d.created_networks
     assert net in d.live_networks
     # コマンド列に internal ネットワーク作成が記録されている（--network=none は使わない）。
-    assert [C.PODMAN, "network", "create", "--internal", net] in d.commands
+    assert [C.PODMAN, "network", "create", "--internal", "--disable-dns", net] in d.commands
 
 
 def test_full_roundtrip_and_network_cleanup():

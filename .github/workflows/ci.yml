@@ -82,10 +82,28 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: podman を導入（ubuntu ランナーは rootless 前提が設定済み）
+      - name: podman を確保（ランナー同梱を優先・不在時のみ apt）
+        # ランナー同梱の podman（/usr/local/bin・5.x）があれば apt を打たない:
+        # apt の 4.9 系を併存させると「pull した個体と別バージョンが同一ストレージを
+        # 操作して podman run が futex 待ちハング」する（実測で確定した障害）。
+        # ドライバ側も PATH 優先検出に修正済みだが、混在自体を作らないのが第一。
         run: |
-          sudo apt-get update
-          sudo apt-get install -y podman
+          if command -v podman; then
+            podman --version
+            exit 0
+          fi
+          # 不在時のみ apt（azure ミラー不調対策: 標準ミラー切替 + リトライ/タイムアウト）。
+          sudo sed -i 's/azure\.archive\.ubuntu\.com/archive.ubuntu.com/g' \
+            /etc/apt/sources.list.d/ubuntu.sources
+          apt_get() {
+            sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 \
+              -o Acquire::https::Timeout=15 "$@"
+          }
+          for _ in 1 2 3; do
+            if apt_get update; then break; fi
+            sleep 5
+          done
+          apt_get install -y podman
           podman --version
       - name: uv をセットアップ（Python 3.11）
         uses: astral-sh/setup-uv@v5

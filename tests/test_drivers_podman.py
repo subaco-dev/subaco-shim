@@ -34,6 +34,32 @@ def test_available_reflects_binary_presence():
     assert PodmanDriver.available() == (shutil.which("podman") is not None)
 
 
+def test_detect_binary_prefers_path_over_system_paths(monkeypatch):
+    """PATH の podman をシステム既知パスより優先すること（CI 実測ハングの再発防止）。
+
+    複数インストール環境（GitHub ランナー: /usr/local 同梱 5.x + apt の /usr/bin 4.9）で
+    ストレージ所有者（= PATH 解決される個体）と別の podman を選ぶと、バージョン混在の
+    ストレージアクセスで `podman run` が futex 待ちハングする。
+    """
+    from subaco_shim.drivers import podman as P
+
+    monkeypatch.setattr(P.shutil, "which", lambda name: "/custom/bin/podman")
+    # システム既知パスがすべて「存在・実行可能」でも PATH 側が勝つ。
+    monkeypatch.setattr(P.os.path, "isfile", lambda p: True)
+    monkeypatch.setattr(P.os, "access", lambda p, m: True)
+    assert P._detect_binary() == "/custom/bin/podman"
+
+
+def test_detect_binary_falls_back_to_system_paths(monkeypatch):
+    # PATH に無ければシステム既知パスへフォールバックする。
+    from subaco_shim.drivers import podman as P
+
+    monkeypatch.setattr(P.shutil, "which", lambda name: None)
+    monkeypatch.setattr(P.os.path, "isfile", lambda p: p == "/usr/local/bin/podman")
+    monkeypatch.setattr(P.os, "access", lambda p, m: True)
+    assert P._detect_binary() == "/usr/local/bin/podman"
+
+
 def test_create_raises_when_binary_absent(monkeypatch):
     # 検出を強制的に「不在」にして、create が明示エラーを送出することを確認。
     monkeypatch.setattr("subaco_shim.drivers.podman._detect_binary", lambda: None)
@@ -81,7 +107,13 @@ def test_preflight_detects_missing_on_linux(monkeypatch):
 def test_argv_builders():
     # 個別ネットワーク作成/掃除・exec・put/get の argv 形（--network=none は使わない）。
     net = C.network_name("abc123")
-    assert C.create_network_argv(net) == ["network", "create", "--internal", "cube-abc123"]
+    assert C.create_network_argv(net) == [
+        "network",
+        "create",
+        "--internal",
+        "--disable-dns",
+        "cube-abc123",
+    ]
     assert C.remove_network_argv(net) == ["network", "rm", "cube-abc123"]
     run = C.run_container_argv(C.container_name("abc123"), net, "img")
     assert "-v" not in run  # ホストマウント禁止。
