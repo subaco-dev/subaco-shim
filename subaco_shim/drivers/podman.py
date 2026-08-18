@@ -26,6 +26,7 @@ Linux CI（ubuntu ランナー）で検証する。このマシン（macOS・pod
 
 from __future__ import annotations
 
+import contextlib
 import math
 import os
 import platform
@@ -331,13 +332,27 @@ class PodmanExecutionHandle(ExecutionHandle):
             if room < len(chunk):
                 self._truncated[idx] = True
 
+    def _close_stdin(self) -> None:
+        """stdin パイプを閉じてコンテナ内ウォッチドッグへ EOF を届ける（冪等）。
+
+        exec_code_argv の stdin 監視ウォッチドッグが EOF を検知して payload を kill する
+        （podman exec クライアントの kill だけではコンテナ内プロセスが生き残ることを
+        nightly 実測で確認——キャンセルのコンテナ内到達はこの EOF 経路が正）。
+        """
+        stdin = self._proc.stdin
+        if stdin is not None:
+            with contextlib.suppress(OSError):
+                stdin.close()
+
     def _kill_group(self) -> None:
         """exec プロセスを**プロセスグループごと** kill する。
 
         ``proc.kill()`` は直接の子しか殺さないため、シェルパイプライン等の孫プロセスが
         stdout の write 端を保持し続けると EOF が来ず drain が終わらない。exec_start は
         ``start_new_session=True`` で起動しており、グループ全体を SIGKILL できる。
+        あわせて stdin を閉じ、コンテナ内 payload の停止（ウォッチドッグ EOF）を届ける。
         """
+        self._close_stdin()
         try:
             os.killpg(self._proc.pid, 9)  # SIGKILL
         except (ProcessLookupError, PermissionError, OSError):
@@ -405,6 +420,8 @@ class PodmanExecutionHandle(ExecutionHandle):
             if not self._join_readers(timeout=5.0):
                 # killpg 後も残る異常系（daemon スレッドのため後始末はプロセス終了時）。
                 _log.error("exec_drain_stuck pid=%s", self._proc.pid)
+        # 正常完了でも stdin パイプを解放する（キャンセル系は _kill_group が閉鎖済み）。
+        self._close_stdin()
         self._finished.set()
 
     def done(self) -> bool:
@@ -589,7 +606,10 @@ class PodmanDriver(Driver):
         try:
             proc = subprocess.Popen(
                 argv,
-                stdin=subprocess.DEVNULL,
+                # stdin はパイプで保持する（書き込まない）。exec_code_argv の stdin 監視
+                # ウォッチドッグへの供給路で、キャンセル／クライアント消滅時に閉じる
+                # （= コンテナ内 EOF → payload kill）。DEVNULL だと即 EOF で誤発火する。
+                stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 # kill をプロセスグループ全体へ届かせる（孫プロセスの pipe 保持対策）。

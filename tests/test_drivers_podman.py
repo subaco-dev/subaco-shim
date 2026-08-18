@@ -126,6 +126,14 @@ def test_argv_builders():
     assert put[-1] == "mkdir -p '/work dir' && cat > '/work dir/契約.bin'"
     # 親なし相対パスは "." を掘る（無害な no-op）。
     assert C.put_file_argv("c", "f.txt")[-1] == "mkdir -p . && cat > f.txt"
+    # exec は stdin 監視ウォッチドッグ付き sh ラッパー（切断キャンセルのコンテナ内到達。
+    # podman exec クライアントの kill だけではコンテナ内プロセスが生き残る——nightly 実測）。
+    ex = C.exec_code_argv("cube-sb-abc123", "print('hi')")
+    assert ex[:5] == ["exec", "-i", "cube-sb-abc123", "sh", "-c"]
+    wrapper = ex[5]
+    assert "python3 -c 'print('\"'\"'hi'\"'\"')' </dev/null" in wrapper  # payload は quote 済み
+    assert "cat >/dev/null" in wrapper and "kill -9" in wrapper  # stdin EOF 監視
+    assert wrapper.rstrip().endswith('wait "$pid"')  # 終了コードは payload のものを返す
 
 
 def test_create_cleans_up_container_and_network_on_run_failure(tmp_path):

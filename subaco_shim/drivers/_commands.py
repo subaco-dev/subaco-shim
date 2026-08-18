@@ -91,12 +91,26 @@ def run_container_argv(container: str, network: str, image: str) -> list[str]:
 
 
 def exec_code_argv(container: str, code: str) -> list[str]:
-    """コンテナ内でコードを実行する argv（E2B run_code 相当の v0 骨子）。
+    """コンテナ内でコードを実行する argv（stdin 監視ウォッチドッグ付き）。
 
-    TODO: 実際の run_code は envd:49999 のトランスポート（Connect RPC/HTTP/SSE 等）で
-    実行される。ここでは骨子として ``python3 -c`` に直接流す薄い経路。
+    **切断キャンセルの実測（nightly）で確定した実バグへの対処**: ``podman exec`` の
+    クライアントプロセスを kill しても、コンテナ内の exec セッションのプロセスは
+    **生き残る**（/tmp/beat ハートビートが cancel 後も更新され続けることを実測）。
+    そこで payload を sh ラッパーで包み、**exec セッションの stdin の EOF** を
+    ウォッチドッグ（``cat`` + ``kill``）で監視する。クライアント消滅（キャンセル・
+    シム異常死・タイムアウト kill のいずれでも）で podman が stdin ストリームを
+    閉じる → ``cat`` が EOF で戻る → payload を kill、という fail-safe 経路になる。
+    呼び出し側（exec_start）は stdin をパイプで保持し、キャンセル時に閉じる。
+
+    payload 自身の stdin は /dev/null（ウォッチドッグ用チャネルを消費させない）。
+    終了コードは payload のものを ``wait`` がそのまま返す。
     """
-    return ["exec", "-i", container, "python3", "-c", code]
+    watchdog = (
+        f"python3 -c {shlex.quote(code)} </dev/null & pid=$!\n"
+        '( cat >/dev/null 2>&1; kill -9 "$pid" 2>/dev/null ) &\n'
+        'wait "$pid"'
+    )
+    return ["exec", "-i", container, "sh", "-c", watchdog]
 
 
 def put_file_argv(container: str, path: str) -> list[str]:
