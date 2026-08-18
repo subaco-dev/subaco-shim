@@ -14,6 +14,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
+      - uses: actions/checkout@v4
+      - name: uv をセットアップ（Python 3.11）
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.11"
       - name: podman を導入
         run: |
           sudo apt-get update
@@ -111,6 +116,38 @@ jobs:
           pgrep -a -f "aardvark" || echo "no aardvark"
           podman rm -f tg || true
           podman network rm net-g || true
+        continue-on-error: true
+      - name: H) 同一 Python プロセスから network create + run（ドライバ経路の忠実再現）
+        run: |
+          set -x
+          rc=0; python3 - <<'EOF' || rc=$?
+          import subprocess
+          def run(argv, timeout=45):
+              print("RUN", argv, flush=True)
+              p = subprocess.run(argv, capture_output=True, timeout=timeout)
+              print("rc=", p.returncode, "out=", p.stdout[:60], "err=", p.stderr[:120], flush=True)
+              return p
+          run(["podman", "network", "create", "--internal", "cube-debugh"])
+          try:
+              run(["podman", "run", "-d", "--name", "cube-sb-debugh", "--network", "cube-debugh",
+                   "--", "docker.io/library/python:3.12-slim", "sleep", "infinity"])
+          except subprocess.TimeoutExpired:
+              print("H TIMEOUT", flush=True)
+              raise SystemExit(124)
+          EOF
+          echo "H rc=$rc"
+          podman rm -f cube-sb-debugh || true
+          podman network rm cube-debugh || true
+        continue-on-error: true
+      - name: I) pytest 単独ファイル実行での再現確認（スイート汚染の切り分け）
+        env:
+          SUBACO_SHIM_LIVE_TEMPLATE: docker.io/library/python:3.12-slim
+        run: |
+          set -x
+          rc=0
+          timeout 240 uv run --with pytest pytest \
+            tests/test_live_podman_isolation.py::test_egress_blocked_by_default -q -rs || rc=$?
+          echo "I rc=$rc"
         continue-on-error: true
       - name: 残プロセスと状態
         if: always()
