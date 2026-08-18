@@ -22,6 +22,7 @@ TODO: ネットワーク間分離の enforce（``-o isolate=true`` の要否）�
 
 from __future__ import annotations
 
+import posixpath
 import shlex
 
 # podman バイナリの既定名（システムインストール優先検出は podman ドライバが行う）。
@@ -94,8 +95,20 @@ def exec_code_argv(container: str, code: str) -> list[str]:
 
 
 def put_file_argv(container: str, path: str) -> list[str]:
-    """ホスト側 bytes をコンテナ内 ``path`` へ書き込む argv（stdin 経由。ホストマウント不使用）。"""
-    return ["exec", "-i", container, "sh", "-c", f"cat > {shlex.quote(path)}"]
+    """ホスト側 bytes をコンテナ内 ``path`` へ書き込む argv（stdin 経由。ホストマウント不使用）。
+
+    E2B の files.write と同じく**親ディレクトリを自動作成**する（envd 実装は書き込み時に
+    ディレクトリを掘る。これがないと実イメージへの ``/work/...`` 等の書き込みが失敗する）。
+    """
+    parent = posixpath.dirname(path) or "."
+    return [
+        "exec",
+        "-i",
+        container,
+        "sh",
+        "-c",
+        f"mkdir -p {shlex.quote(parent)} && cat > {shlex.quote(path)}",
+    ]
 
 
 def get_file_argv(container: str, path: str) -> list[str]:

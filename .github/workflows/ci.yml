@@ -91,7 +91,16 @@ jobs:
         uses: astral-sh/setup-uv@v5
         with:
           python-version: "3.11"
-      - name: pytest（podman 検出時のみ実コンテナ経路も対象。未検出テストは shutil.which で skip）
-        # 実バックエンド e2e 契約は SUBACO_SHIM_LIVE_TEMPLATE を渡したときのみ走る（既定は skip）。
-        # TODO: provision 済みテンプレート参照を Secrets 経由で与え、実機統合を有効化する。
-        run: uv run --with pytest pytest -q
+      - name: サンドボックスイメージを事前 pull（create 時 120s タイムアウトから pull を分離）
+        env:
+          LIVE_TEMPLATE: docker.io/library/python:3.12-slim
+        run: podman pull "$LIVE_TEMPLATE"
+      - name: pytest（実コンテナ統合——M2a-5 実測＝egress 遮断・サンドボックス間分離・切断キャンセル）
+        # SUBACO_SHIM_LIVE_TEMPLATE を渡すと実ドライバ契約（test_driver_contract）と
+        # 実測スイート（test_live_podman_isolation）が有効化される。イメージ要件は
+        # python3 / sh / GNU sleep（sleep infinity）。busybox の sleep は infinity 非対応の
+        # ため alpine 系は不可。TODO: subaco の共通サンドボックスイメージ
+        # （ghcr.io/subaco-dev/subaco-sandbox）が public になったら digest 固定参照へ切替。
+        env:
+          SUBACO_SHIM_LIVE_TEMPLATE: docker.io/library/python:3.12-slim
+        run: uv run --with pytest pytest -q -rs

@@ -86,6 +86,13 @@ def test_argv_builders():
     assert "-v" not in run  # ホストマウント禁止。
     assert "--network" in run and net in run
     assert C.get_file_argv("cube-sb-abc123", "/p") == ["exec", "cube-sb-abc123", "cat", "--", "/p"]
+    # put_file は E2B files.write と同じく親ディレクトリを自動作成する（実イメージには
+    # /work 等が存在しないため、mkdir -p がないと実機統合の書き込みが失敗する）。
+    put = C.put_file_argv("cube-sb-abc123", "/work dir/契約.bin")
+    assert put[:4] == ["exec", "-i", "cube-sb-abc123", "sh"]
+    assert put[-1] == "mkdir -p '/work dir' && cat > '/work dir/契約.bin'"
+    # 親なし相対パスは "." を掘る（無害な no-op）。
+    assert C.put_file_argv("c", "f.txt")[-1] == "mkdir -p . && cat > f.txt"
 
 
 # --- exec_start（drain スレッド・タイムアウト・キャンセル）: fake バイナリで実プロセス検証 ---
