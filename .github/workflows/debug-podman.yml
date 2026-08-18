@@ -20,9 +20,23 @@ jobs:
         with:
           python-version: "3.11"
       - name: podman を導入
+        timeout-minutes: 8
         run: |
-          sudo apt-get update
-          sudo apt-get install -y podman
+          set -x
+          # azure ミラー不調（本日 2 回、install が 15 分ハング）対策:
+          # 標準ミラーへ切替 + 取得リトライ/タイムアウト。
+          sudo sed -i 's/azure\.archive\.ubuntu\.com/archive.ubuntu.com/g' \
+            /etc/apt/sources.list.d/ubuntu.sources
+          apt_get() {
+            sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 \
+              -o Acquire::https::Timeout=15 "$@"
+          }
+          for _ in 1 2 3; do
+            if apt_get update; then break; fi
+            sleep 5
+          done
+          apt_get install -y podman
+          podman --version
       - name: バージョンと環境
         run: |
           set -x
