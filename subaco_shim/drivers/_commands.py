@@ -104,10 +104,16 @@ def exec_code_argv(container: str, code: str) -> list[str]:
 
     payload 自身の stdin は /dev/null（ウォッチドッグ用チャネルを消費させない）。
     終了コードは payload のものを ``wait`` がそのまま返す。
+
+    **fd 3 経由で渡す理由**: POSIX sh はバックグラウンドジョブ（``&``）の stdin を
+    暗黙に /dev/null へ差し替えるため、素朴に ``( cat; kill ) &`` と書くと cat が
+    即 EOF になり payload を即殺する（nightly 実測で 'Killed' として顕在化）。
+    実 stdin を ``exec 3<&0`` で複製し、ウォッチドッグは fd 3 から読む。
     """
     watchdog = (
-        f"python3 -c {shlex.quote(code)} </dev/null & pid=$!\n"
-        '( cat >/dev/null 2>&1; kill -9 "$pid" 2>/dev/null ) &\n'
+        "exec 3<&0\n"
+        f"python3 -c {shlex.quote(code)} </dev/null 3<&- & pid=$!\n"
+        '( cat <&3 >/dev/null 2>&1; kill -9 "$pid" 2>/dev/null ) &\n'
         'wait "$pid"'
     )
     return ["exec", "-i", container, "sh", "-c", watchdog]

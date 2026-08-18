@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import shutil
+import subprocess
 
 import pytest
 
@@ -131,9 +132,77 @@ def test_argv_builders():
     ex = C.exec_code_argv("cube-sb-abc123", "print('hi')")
     assert ex[:5] == ["exec", "-i", "cube-sb-abc123", "sh", "-c"]
     wrapper = ex[5]
+    assert wrapper.startswith("exec 3<&0\n")  # 実 stdin を fd3 へ（& の暗黙 /dev/null 対策）
     assert "python3 -c 'print('\"'\"'hi'\"'\"')' </dev/null" in wrapper  # payload は quote 済み
-    assert "cat >/dev/null" in wrapper and "kill -9" in wrapper  # stdin EOF 監視
+    assert "cat <&3 >/dev/null" in wrapper and "kill -9" in wrapper  # stdin EOF 監視
     assert wrapper.rstrip().endswith('wait "$pid"')  # 終了コードは payload のものを返す
+
+
+def _run_watchdog_wrapper(tmp_path, code: str) -> subprocess.Popen[bytes]:
+    """exec_code_argv のラッパー部分をホストの sh で直接実行する（podman 不要）。"""
+    wrapper = C.exec_code_argv("ignored", code)[5]
+    return subprocess.Popen(
+        ["sh", "-c", wrapper],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
+def test_exec_watchdog_keeps_payload_alive_while_stdin_open(tmp_path):
+    """stdin が開いている間は payload を殺さないこと（暗黙 /dev/null 差し替えの回帰）。
+
+    POSIX sh は `&` ジョブの stdin を暗黙に /dev/null へ差し替えるため、fd3 複製を
+    忘れるとウォッチドッグの cat が即 EOF になり payload を即殺する（nightly 実測で
+    'Killed' として顕在化した実バグ）。sh をホストで直接実行して意味論を固定する。
+    """
+    import time
+
+    beat = tmp_path / "beat"
+    code = (
+        "import pathlib, time\n"
+        f"p = pathlib.Path({str(beat)!r})\n"
+        "while True:\n"
+        "    p.write_text(str(time.time()))\n"
+        "    time.sleep(0.05)\n"
+    )
+    proc = _run_watchdog_wrapper(tmp_path, code)
+    try:
+        deadline = time.monotonic() + 10
+        while not beat.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert beat.exists(), "payload が開始しない"
+        # stdin を開いたまま 0.5 秒——payload は生き続ける（更新が進む）。
+        first = beat.read_text()
+        time.sleep(0.5)
+        assert proc.poll() is None, "stdin が開いているのに wrapper が終了した"
+        assert beat.read_text() != first, "stdin が開いているのに payload が停止した"
+
+        # stdin を閉じる（= クライアント消滅相当）→ payload ごと終了する。
+        proc.stdin.close()
+        assert proc.wait(timeout=10) != 0  # kill -9 された payload の rc は非ゼロ
+        stopped = beat.read_text()
+        time.sleep(0.3)
+        assert beat.read_text() == stopped, "stdin EOF 後も payload が生きている"
+    finally:
+        import contextlib
+        import os
+        import signal
+
+        # 途中失敗時の残骸掃除（正常系ではグループ消滅済みで ProcessLookupError）。
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(proc.pid, signal.SIGKILL)
+
+
+def test_exec_watchdog_propagates_payload_exit_code(tmp_path):
+    """正常完了時は payload の終了コードがそのまま返ること。"""
+    proc = _run_watchdog_wrapper(tmp_path, "import sys; sys.exit(7)")
+    try:
+        assert proc.wait(timeout=15) == 7
+    finally:
+        if proc.stdin is not None:
+            proc.stdin.close()
 
 
 def test_create_cleans_up_container_and_network_on_run_failure(tmp_path):
