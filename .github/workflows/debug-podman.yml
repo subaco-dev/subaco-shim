@@ -214,6 +214,79 @@ jobs:
           podman rm -f cube-sb-debugm || true
           podman network rm cube-debugm || true
         continue-on-error: true
+      - name: N) uv python × driver 直呼び（pytest 抜き）+ ハング時剖検
+        env:
+          SUBACO_SHIM_LIVE_TEMPLATE: docker.io/library/python:3.12-slim
+        run: |
+          set -x
+          cat > /tmp/probe_n.py <<'EOF'
+          import os
+          from subaco_shim.drivers.podman import PodmanDriver
+          d = PodmanDriver()
+          info = d.create(template_id=os.environ["SUBACO_SHIM_LIVE_TEMPLATE"])
+          print("N completed", info.sandbox_id, flush=True)
+          d.destroy(info.sandbox_id)
+          EOF
+          rc=0
+          uv run python /tmp/probe_n.py &
+          npid=$!
+          sleep 40
+          if kill -0 "$npid" 2>/dev/null; then
+            echo "N still running -> autopsy"
+            # shellcheck disable=SC2009  # プロセスツリー（ps f）が必要なため pgrep では代替不可
+            ps auxfww | grep -E "podman|conmon|netavark|aardvark|probe_n" | grep -v grep || true
+            for pid in $(pgrep -x podman); do
+              echo "== podman $pid wchan=$(cat /proc/"$pid"/wchan 2>/dev/null || true)"
+              tr '\0' ' ' < /proc/"$pid"/cmdline || true; echo
+            done
+            kill -9 "$npid" || true
+            rc=124
+          else
+            wait "$npid" || rc=$?
+          fi
+          echo "N rc=$rc"
+        continue-on-error: true
+      - name: O) pytest × subprocess 直呼び（/usr/bin/podman 明示パス）
+        run: |
+          set -x
+          cat > /tmp/test_probe_o.py <<'EOF'
+          import subprocess
+          def test_probe_o():
+              subprocess.run(["/usr/bin/podman", "network", "create", "--internal", "cube-debugo"],
+                             capture_output=True, timeout=45, check=True)
+              p = subprocess.run(["/usr/bin/podman", "run", "-d", "--name", "cube-sb-debugo",
+                                  "--network", "cube-debugo",
+                                  "--", "docker.io/library/python:3.12-slim", "sleep", "infinity"],
+                                 capture_output=True, timeout=45, check=True)
+              assert p.stdout
+          EOF
+          rc=0
+          timeout 240 uv run --with pytest pytest /tmp/test_probe_o.py -q || rc=$?
+          echo "O rc=$rc"
+          podman rm -f cube-sb-debugo || true
+          podman network rm cube-debugo || true
+        continue-on-error: true
+      - name: P) pytest × subprocess 直呼び + subaco_shim import（副作用切り分け）
+        run: |
+          set -x
+          cat > /tmp/test_probe_p.py <<'EOF'
+          import subprocess
+          import subaco_shim.drivers.podman  # noqa: F401  import 副作用の有無だけを見る
+          def test_probe_p():
+              subprocess.run(["podman", "network", "create", "--internal", "cube-debugp"],
+                             capture_output=True, timeout=45, check=True)
+              p = subprocess.run(["podman", "run", "-d", "--name", "cube-sb-debugp",
+                                  "--network", "cube-debugp",
+                                  "--", "docker.io/library/python:3.12-slim", "sleep", "infinity"],
+                                 capture_output=True, timeout=45, check=True)
+              assert p.stdout
+          EOF
+          rc=0
+          timeout 240 uv run --with pytest pytest /tmp/test_probe_p.py -q || rc=$?
+          echo "P rc=$rc"
+          podman rm -f cube-sb-debugp || true
+          podman network rm cube-debugp || true
+        continue-on-error: true
       - name: 残プロセスと状態
         if: always()
         run: |
@@ -221,3 +294,6 @@ jobs:
           pgrep -a -f "aardvark|netavark|slirp|pasta|conmon" || true
           podman ps -a || true
           podman network ls || true
+          # ハング変種の残骸掃除（次回実行への影響防止）
+          podman ps -aq --filter "name=cube-sb-" | xargs -r podman rm -f || true
+          podman network ls --format '{{.Name}}' | grep '^cube-' | xargs -r -n1 podman network rm || true
