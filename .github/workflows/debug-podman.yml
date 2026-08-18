@@ -1,0 +1,79 @@
+name: debug-podman
+# 一時的な診断ワークフロー（M2a-5 実測で `podman run -d --network <internal>` が
+# ubuntu ランナーで 120s ハングした事象の切り分け用）。診断完了後に削除する。
+# 仮説: rootless + netavark/aardvark-dns/pasta の組み合わせでの custom network 起動不全。
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: podman を導入
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y podman
+      - name: バージョンと環境
+        run: |
+          set -x
+          podman version || true
+          podman info --format '{{.Host.NetworkBackend}} {{.Host.NetworkBackendInfo.Version}}' || true
+          which slirp4netns pasta aardvark-dns netavark || true
+          slirp4netns --version 2>/dev/null || true
+          pasta --version 2>/dev/null || true
+      - name: イメージ pull
+        run: podman pull docker.io/library/python:3.12-slim
+      - name: A) 既定ネットワークで run
+        run: |
+          set -x
+          rc=0; timeout 45 podman run -d --name ta docker.io/library/python:3.12-slim sleep infinity || rc=$?
+          echo "A rc=$rc"
+          podman rm -f ta || true
+      - name: B) 通常 custom bridge で run
+        run: |
+          set -x
+          podman network create net-b
+          rc=0; timeout 45 podman run -d --name tb --network net-b docker.io/library/python:3.12-slim sleep infinity || rc=$?
+          echo "B rc=$rc"
+          podman rm -f tb || true
+          podman network rm net-b || true
+        continue-on-error: true
+      - name: C) internal で run（事象の再現想定）
+        run: |
+          set -x
+          podman network create --internal net-c
+          rc=0; timeout 45 podman run -d --name tc --network net-c docker.io/library/python:3.12-slim sleep infinity || rc=$?
+          echo "C rc=$rc"
+          podman rm -f tc || true
+          podman network rm net-c || true
+        continue-on-error: true
+      - name: D) internal + DNS 無効で run
+        run: |
+          set -x
+          podman network create --internal --disable-dns net-d
+          rc=0; timeout 45 podman run -d --name td --network net-d docker.io/library/python:3.12-slim sleep infinity || rc=$?
+          echo "D rc=$rc"
+          podman rm -f td || true
+          podman network rm net-d || true
+        continue-on-error: true
+      - name: E) internal のデバッグログ（どこで止まるか）
+        run: |
+          set -x
+          podman network create --internal net-e
+          rc=0; timeout 60 podman --log-level=debug run -d --name te --network net-e docker.io/library/python:3.12-slim sleep infinity 2>&1 | tail -60 || rc=$?
+          echo "E rc=$rc"
+          podman rm -f te || true
+          podman network rm net-e || true
+        continue-on-error: true
+      - name: 残プロセスと状態
+        if: always()
+        run: |
+          set -x
+          pgrep -a -f "aardvark|netavark|slirp|pasta|conmon" || true
+          podman ps -a || true
+          podman network ls || true
