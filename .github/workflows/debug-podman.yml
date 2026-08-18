@@ -70,6 +70,48 @@ jobs:
           podman rm -f te || true
           podman network rm net-e || true
         continue-on-error: true
+      - name: F) Python subprocess（capture_output）× internal+DNS——パイプ EOF 待ちハング仮説の再現
+        run: |
+          set -x
+          podman network create --internal net-f
+          rc=0; python3 - <<'EOF' || rc=$?
+          import subprocess
+          try:
+              p = subprocess.run(
+                  ["podman", "run", "-d", "--name", "tf", "--network", "net-f",
+                   "--", "docker.io/library/python:3.12-slim", "sleep", "infinity"],
+                  capture_output=True, timeout=45)
+              print("F completed rc=", p.returncode, "stdout=", p.stdout[:80])
+          except subprocess.TimeoutExpired:
+              print("F TIMEOUT (pipe EOF 待ちハングを再現)")
+              raise SystemExit(124)
+          EOF
+          echo "F rc=$rc"
+          pgrep -a -f "aardvark" || echo "no aardvark"
+          podman rm -f tf || true
+          podman network rm net-f || true
+        continue-on-error: true
+      - name: G) Python subprocess（capture_output）× internal+--disable-dns——修正候補の検証
+        run: |
+          set -x
+          podman network create --internal --disable-dns net-g
+          rc=0; python3 - <<'EOF' || rc=$?
+          import subprocess
+          try:
+              p = subprocess.run(
+                  ["podman", "run", "-d", "--name", "tg", "--network", "net-g",
+                   "--", "docker.io/library/python:3.12-slim", "sleep", "infinity"],
+                  capture_output=True, timeout=45)
+              print("G completed rc=", p.returncode, "stdout=", p.stdout[:80])
+          except subprocess.TimeoutExpired:
+              print("G TIMEOUT")
+              raise SystemExit(124)
+          EOF
+          echo "G rc=$rc"
+          pgrep -a -f "aardvark" || echo "no aardvark"
+          podman rm -f tg || true
+          podman network rm net-g || true
+        continue-on-error: true
       - name: 残プロセスと状態
         if: always()
         run: |
