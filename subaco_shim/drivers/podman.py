@@ -540,7 +540,10 @@ class PodmanDriver(Driver):
         try:
             self._run(C.run_container_argv(cont, net, template_id))
         except Exception:
-            # コンテナ起動に失敗したらネットワーク残骸を掃除する。
+            # コンテナ起動に失敗したら残骸を掃除する。run がタイムアウト等で失敗しても
+            # コンテナ記録が作られていることがある（実測: CI の 120s タイムアウト）ため、
+            # コンテナ → ネットワークの順に best-effort で削除する。
+            self._run(C.remove_container_argv(cont), check=False)
             self._run(C.remove_network_argv(net), check=False)
             raise
         info = SandboxInfo(

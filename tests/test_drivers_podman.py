@@ -13,6 +13,7 @@ import pytest
 from subaco_shim.drivers import _commands as C
 from subaco_shim.drivers.podman import (
     RUNBOOK_ROOTLESS,
+    PodmanCommandError,
     PodmanDriver,
     PodmanPreflightError,
     PodmanUnavailableError,
@@ -93,6 +94,25 @@ def test_argv_builders():
     assert put[-1] == "mkdir -p '/work dir' && cat > '/work dir/契約.bin'"
     # 親なし相対パスは "." を掘る（無害な no-op）。
     assert C.put_file_argv("c", "f.txt")[-1] == "mkdir -p . && cat > f.txt"
+
+
+def test_create_cleans_up_container_and_network_on_run_failure(tmp_path):
+    """run 失敗時にコンテナ → ネットワークの順で残骸を掃除して例外を再送出すること。
+
+    実測: CI で `podman run -d --network <internal>` がタイムアウトした場合でも
+    コンテナ記録が作られていることがある。従来はネットワークしか掃除せず、
+    コンテナ残骸（cube-sb-<id>）がリークした。
+    """
+    fake = tmp_path / "fake-podman"
+    fake.write_text('#!/bin/sh\nif [ "$1" = run ]; then exit 125; fi\nexit 0\n')
+    fake.chmod(0o755)
+    d = PodmanDriver(binary=str(fake))
+    with pytest.raises(PodmanCommandError):
+        d.create(template_id="img")
+    subcommands = [cmd[1:3] for cmd in d.commands]
+    assert subcommands[0] == ["network", "create"]
+    assert ["rm", "-f"] in subcommands  # コンテナ残骸の掃除（best-effort）
+    assert subcommands[-1] == ["network", "rm"]  # ネットワーク残骸の掃除（最後）
 
 
 # --- exec_start（drain スレッド・タイムアウト・キャンセル）: fake バイナリで実プロセス検証 ---
