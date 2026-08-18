@@ -95,6 +95,8 @@ jobs:
         env:
           LIVE_TEMPLATE: docker.io/library/python:3.12-slim
         run: podman pull "$LIVE_TEMPLATE"
+      - name: 依存を同期（実 SDK 固定版を含む test extra——全スタック E2E 用）
+        run: uv sync --extra test
       - name: pytest（実コンテナ統合——M2a-5 実測＝egress 遮断・サンドボックス間分離・切断キャンセル）
         # SUBACO_SHIM_LIVE_TEMPLATE を渡すと実ドライバ契約（test_driver_contract）と
         # 実測スイート（test_live_podman_isolation）が有効化される。イメージ要件は
@@ -103,4 +105,12 @@ jobs:
         # （ghcr.io/subaco-dev/subaco-sandbox）が public になったら digest 固定参照へ切替。
         env:
           SUBACO_SHIM_LIVE_TEMPLATE: docker.io/library/python:3.12-slim
-        run: uv run --with pytest pytest -q -rs
+        run: uv run pytest -q -rs
+      - name: pytest（実 SDK × 実 podman の全スタック E2E——M2a DoD。専用プロセスで実行）
+        # test_live_podman_wire は SDK（httpx）の SSL context キャッシュ対策として
+        # SUBACO_SHIM_LIVE_WIRE=1 の独立プロセスでのみ走る（test_wire_contract の
+        # mock シムと同一プロセスに同居させない——README のテスト技法参照）。
+        env:
+          SUBACO_SHIM_LIVE_TEMPLATE: docker.io/library/python:3.12-slim
+          SUBACO_SHIM_LIVE_WIRE: "1"
+        run: uv run pytest tests/test_live_podman_wire.py -q -rs
