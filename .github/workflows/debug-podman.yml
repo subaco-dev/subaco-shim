@@ -149,6 +149,57 @@ jobs:
             tests/test_live_podman_isolation.py::test_egress_blocked_by_default -q -rs || rc=$?
           echo "I rc=$rc"
         continue-on-error: true
+      - name: J) uv の Python 単体（pytest 抜き）で network create + run
+        run: |
+          set -x
+          rc=0; uv run python - <<'EOF' || rc=$?
+          import subprocess
+          subprocess.run(["podman", "network", "create", "--internal", "cube-debugj"],
+                         capture_output=True, timeout=45, check=True)
+          try:
+              p = subprocess.run(["podman", "run", "-d", "--name", "cube-sb-debugj",
+                                  "--network", "cube-debugj",
+                                  "--", "docker.io/library/python:3.12-slim", "sleep", "infinity"],
+                                 capture_output=True, timeout=45, check=True)
+              print("J completed", p.stdout[:60], flush=True)
+          except subprocess.TimeoutExpired:
+              print("J TIMEOUT", flush=True)
+              raise SystemExit(124)
+          EOF
+          echo "J rc=$rc"
+          podman rm -f cube-sb-debugj || true
+          podman network rm cube-debugj || true
+        continue-on-error: true
+      - name: K) pytest -s（capture 無効）で単独テスト実行
+        env:
+          SUBACO_SHIM_LIVE_TEMPLATE: docker.io/library/python:3.12-slim
+        run: |
+          set -x
+          rc=0
+          timeout 240 uv run --with pytest pytest \
+            tests/test_live_podman_isolation.py::test_egress_blocked_by_default -q -rs -s || rc=$?
+          echo "K rc=$rc"
+        continue-on-error: true
+      - name: M) pytest × driver 抜き（subprocess 直呼びのミニテスト）
+        run: |
+          set -x
+          cat > /tmp/test_probe.py <<'EOF'
+          import subprocess
+          def test_probe():
+              subprocess.run(["podman", "network", "create", "--internal", "cube-debugm"],
+                             capture_output=True, timeout=45, check=True)
+              p = subprocess.run(["podman", "run", "-d", "--name", "cube-sb-debugm",
+                                  "--network", "cube-debugm",
+                                  "--", "docker.io/library/python:3.12-slim", "sleep", "infinity"],
+                                 capture_output=True, timeout=45, check=True)
+              assert p.stdout
+          EOF
+          rc=0
+          timeout 240 uv run --with pytest pytest /tmp/test_probe.py -q || rc=$?
+          echo "M rc=$rc"
+          podman rm -f cube-sb-debugm || true
+          podman network rm cube-debugm || true
+        continue-on-error: true
       - name: 残プロセスと状態
         if: always()
         run: |
