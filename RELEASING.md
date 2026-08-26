@@ -37,12 +37,17 @@ Publishing）・固定 requirements 生成までを行う。人手の手順は�
    `templates/multi-agent/requirements-shim.txt` を置き換える
    （ローカル生成する場合: `just export-reqs`）。
 2. `templates/multi-agent/wrappers/cube-shim.sh` の固定版（`subaco-shim==<版>`）を更新する。
-3. subaco 側で smoke CI が green になることを確認してコミットする。
+3. `scripts/sandbox_run.py` をこのリリースで変更した場合は、subaco 側で
+   `just sync-sandbox-run` を実行してテンプレート正典
+   （`templates/multi-agent/scripts/sandbox_run.py`）へ同期する（両コピーは byte 一致が規約。
+   `just sync-sandbox-run-check` で検査できる）。
+4. subaco 側で smoke CI が green になることを確認してコミットする。
 
 ## 備考
 
 - 実行時依存は certifi のみ（`SSL_CERT_FILE` 用の certifi 結合 CA バンドル生成に必須——
   シム証明書単体のバンドルは SDK 側プロセスの通常 HTTPS を壊すため）。requirements には
   certifi が載るのが正常。E2B SDK は test extra で、配布物には含めない（遅延依存方針）。
-- E2B SDK 互換の再現範囲が確定する M2a-1 spike の結果次第で、`test` extra の
-  `e2b-code-interpreter` を固定版に pin する（pyproject.toml の TODO）。
+- `test` extra の E2B SDK は spike 確定の組（`e2b==2.30.0` / `e2b-code-interpreter==2.8.1`）に
+  pin 済み。テンプレート側 pyproject（subaco の multi-agent）も同じ組を pin しており、
+  SDK を更新する場合はワイヤ契約テスト green を確認してから両方を揃えて上げる。

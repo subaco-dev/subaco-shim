@@ -2,10 +2,12 @@
 """sandbox_run.py — 隔離環境でエージェント生成コードを検証する（M2a-4 本実装）。
 
 ============================================================================
-このファイルは **リファレンス（同梱コピー）** です。
-**正典（canonical）はテンプレート側（subaco の multi-agent テンプレート）** に置かれ、
-プロジェクトへ scaffold されます（テンプレート組み込みは M2b-3）。shim リポジトリには、
-SDK 契約・構造化出力形状の参照実装として同梱しています。
+**正典（canonical）は subaco の multi-agent テンプレート**
+（templates/multi-agent/scripts/sandbox_run.py）で、プロジェクトへ scaffold される。
+subaco-shim リポジトリには SDK 契約・構造化出力形状の参照実装として**同一内容**を
+scripts/sandbox_run.py に同梱し、テスト（tests/test_sandbox_run.py・live wire）で
+挙動を固定する。**変更手順:** shim 側で編集・テスト → subaco の `just sync-sandbox-run`
+でテンプレートへ同期（両コピーは byte 一致——本バナーも共通文面）。
 ============================================================================
 
 役割（協業ループ）:
