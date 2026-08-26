@@ -218,6 +218,7 @@ export CUBE_POST_DESTROY_CMD="sudo /usr/local/bin/cube-hosts remove"
 
 ```bash
 subaco-shim serve --driver auto      # ホスト検出（既定）
+subaco-shim serve --driver container # Apple Container（vm-per-container。オプトイン不要）
 subaco-shim serve --driver podman    # 共有カーネル（要 allow_shared_kernel オプトイン）
 subaco-shim serve --driver mock      # in-memory（実コンテナ不要。CI / dev の主役）
 subaco-shim status                   # 設定・.cube 状態・稼働状態を表示
@@ -233,13 +234,25 @@ cube-shim 本体は Unix / WSL2 前提（`fcntl` を使うためネイティブ 
 | OS | 既定ドライバ | 隔離レベル | 状況 |
 |---|---|---|---|
 | Linux | podman | shared-kernel | 実装済み（`allow_shared_kernel` オプトイン必須）。rootless 前提は下記 runbook。 |
-| macOS (Apple Silicon) | container（Apple Container） | vm-per-container | スケルトン（experimental）。実装は Apple Silicon 実機で検証予定。 |
+| macOS (Apple Silicon) | container（Apple Container） | vm-per-container | 実装済み（要 macOS 26+ / Apple Container v1.0+。前提は下記 runbook）。 |
 | Windows (WSL2 内) | wslc | shared-kernel | スケルトン（experimental）。GA まで暫定。DoD 未達なら podman on WSL2 を既定に。 |
 
 実バックエンドでの e2e（コード実行・A→B 到達遮断・データプレーン到達）は **実機統合**で
 検証する。契約テスト（`tests/`）は mock ドライバとコマンド列で設計意図を固定する回帰ガードであり、
 実機統合とは分離している。実ドライバ契約テストは `SUBACO_SHIM_LIVE_TEMPLATE` に provision 済み
-テンプレート参照を渡したときのみ走る（既定は skip）。
+テンプレート参照を渡したときのみ走る（既定は skip）。podman は Linux nightly、Apple Container は
+Apple Silicon 実機（GitHub ホストの macOS ランナーはネスト仮想化不可のため対象外）で実測する。
+
+## runbook: Apple Container 前提（macOS）
+
+前提が欠ける場合、シムは `AppleContainerUnavailableError` / `AppleContainerPreflightError`
+（runbook 付き）で明示的に失敗する。
+
+1. [apple/container の Releases](https://github.com/apple/container/releases) から署名済み
+   installer pkg をインストールする（v1.0 以上。`container --version` で確認）。
+2. `container system start` でサービスを起動する（初回はビルトインカーネルの取得を伴い得る）。
+3. 要件: macOS 26 以上 / Apple Silicon。複数ネットワーク作成とサンドボックス間分離は
+   macOS 15 では成立しない（Apple の technical overview 明記）ため、シムは前提チェックで弾く。
 
 ## runbook: podman rootless 前提（非 NixOS Linux）
 

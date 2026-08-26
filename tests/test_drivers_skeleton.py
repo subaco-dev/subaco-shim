@@ -1,4 +1,8 @@
-"""apple_container / wslc スケルトンドライバの import・ガード。"""
+"""wslc スケルトンドライバの import・ガードとドライバレジストリ。
+
+apple_container は M2b-1 で本実装になった（tests/test_drivers_apple_container.py）。
+ここに残るのは wslc スケルトンのガードと、レジストリ／auto 選択の検証。
+"""
 
 from __future__ import annotations
 
@@ -16,15 +20,6 @@ def test_skeleton_isolation_levels():
     assert AppleContainerDriver.isolation_level is IsolationLevel.VM_PER_CONTAINER
     assert WslcDriver.isolation_level is IsolationLevel.SHARED_KERNEL
     assert WslcDriver.experimental is True
-
-
-def test_apple_container_methods_not_implemented(monkeypatch):
-    # macOS だが CLI 不在を模擬 → NotImplementedError（未実装部の TODO）。
-    monkeypatch.setattr("subaco_shim.drivers.apple_container.platform.system", lambda: "Darwin")
-    monkeypatch.setattr("subaco_shim.drivers.apple_container.shutil.which", lambda name: None)
-    d = AppleContainerDriver()
-    with pytest.raises(NotImplementedError):
-        d.create(template_id="tmpl")
 
 
 def test_wslc_native_windows_guarded(monkeypatch):

@@ -5,8 +5,8 @@
 - :class:`~subaco_shim.drivers.podman.PodmanDriver`        — podman（shared-kernel）
 - :class:`~subaco_shim.drivers.mock.MockDriver`            — in-memory 契約テスト用（CI の主役）
 - :class:`~subaco_shim.drivers.apple_container.AppleContainerDriver`
-      — Apple Container（vm-per-container、experimental スケルトン）
-- :class:`~subaco_shim.drivers.wslc.WslcDriver` — wslc（shared-kernel、experimental）
+      — Apple Container（vm-per-container。実機実測は live スイート——M2b-1）
+- :class:`~subaco_shim.drivers.wslc.WslcDriver` — wslc（shared-kernel、experimental スケルトン）
 
 各具体ドライバはバックエンド CLI をサブプロセスで扱い、CLI 不在でもモジュール自体は
 import 可能に保つ。ドライバ選択は :func:`build_driver` / :func:`select_driver`。

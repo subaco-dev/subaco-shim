@@ -4,6 +4,10 @@
 隔離レベルが構造化出力として返却され」る部分を自動テスト化する（hive への記録は
 手動 E2E シナリオの担当——本モジュールのスコープ外）。
 
+ドライバは ``SUBACO_SHIM_LIVE_DRIVER`` で選択する（既定 podman——Linux nightly。
+Apple Silicon 実機では ``container`` を指定して M2b-1 の全スタック実測に再利用する。
+ファイル名は nightly の呼び出し互換のため据え置き）。
+
 **必ず独立した pytest プロセスで実行する**（``SUBACO_SHIM_LIVE_WIRE=1`` ゲート）:
 SDK（httpx）は SSL context をプロセス内でキャッシュするため、test_wire_contract の
 mock シムと同一プロセスで走らせると、後から起動した別証明書の本シムを信頼できない
@@ -22,7 +26,7 @@ from pathlib import Path
 import pytest
 
 from subaco_shim.config import CubePaths, ShimConfig
-from subaco_shim.drivers.podman import PodmanDriver
+from subaco_shim.drivers import build_driver
 from subaco_shim.lifecycle import check_subdomain_resolution, start_shim
 from subaco_shim.tokens import read_token
 
@@ -31,6 +35,20 @@ e2b_code_interpreter = pytest.importorskip(
 )
 
 TEMPLATE = os.environ.get("SUBACO_SHIM_LIVE_TEMPLATE")
+DRIVER_NAME = os.environ.get("SUBACO_SHIM_LIVE_DRIVER", "podman")
+
+
+def _driver_available() -> bool:
+    try:
+        return build_driver(DRIVER_NAME).available()
+    except (ValueError, RuntimeError):
+        return False
+
+
+def _expected_isolation() -> str:
+    """選択ドライバの宣言隔離レベル（get_info metadata の期待値——3 値保証の正典）。"""
+    return str(build_driver(DRIVER_NAME).isolation_level)
+
 
 pytestmark = [
     pytest.mark.skipif(
@@ -38,8 +56,9 @@ pytestmark = [
         reason="SUBACO_SHIM_LIVE_WIRE=1 の専用プロセスでのみ実行（SSL context キャッシュ対策）",
     ),
     pytest.mark.skipif(
-        TEMPLATE is None or not PodmanDriver.available(),
-        reason="SUBACO_SHIM_LIVE_TEMPLATE 未設定または podman 未検出（実機統合でのみ実行）",
+        TEMPLATE is None or not _driver_available(),
+        reason="SUBACO_SHIM_LIVE_TEMPLATE 未設定または選択ドライバ"
+        "（SUBACO_SHIM_LIVE_DRIVER、既定 podman）未検出（実機統合でのみ実行）",
     ),
     pytest.mark.skipif(
         shutil.which("openssl") is None, reason="TLS 証明書生成に openssl CLI が必要"
@@ -53,16 +72,17 @@ pytestmark = [
 
 
 @pytest.fixture(scope="module")
-def podman_shim(tmp_path_factory):
-    """実 podman ドライバでシムを実起動する（.envrc / M2a-6 と同じ接続配線）。"""
+def live_shim(tmp_path_factory):
+    """選択した実ドライバでシムを実起動する（.envrc / M2a-6 と同じ接続配線）。"""
     mp = pytest.MonkeyPatch()
     paths = CubePaths.resolve(tmp_path_factory.mktemp("live-wire"))
     shim = start_shim(
         paths=paths,
-        # 実行系 CI はホスト管理者オプトイン済み環境に相当する（M2 DoD の検証前提）。
+        # 実行系 CI はホスト管理者オプトイン済み環境に相当する（M2 DoD の検証前提。
+        # vm-per-container 以上のドライバでは無条件許可なのでこの設定は無害）。
         # shared-kernel の既定 deny（オプトインなし拒否）自体は test_access_control が検証する。
         config=ShimConfig(allow_shared_kernel=True),
-        driver=PodmanDriver(),
+        driver=build_driver(DRIVER_NAME),
         idle_timeout=0,
         default_template_id=TEMPLATE,
     )
@@ -86,7 +106,7 @@ def podman_shim(tmp_path_factory):
         shim.close()
 
 
-def test_sdk_full_stack_on_real_podman(podman_shim):
+def test_sdk_full_stack_on_real_backend(live_shim):
     """create → run_code → files write/read → get_info → kill を実 SDK × 実コンテナで往復する。"""
     from e2b_code_interpreter import Sandbox
 
@@ -101,15 +121,15 @@ def test_sdk_full_stack_on_real_podman(podman_shim):
         sbx.files.write("/work/live.txt", "live subaco")
         assert sbx.files.read("/work/live.txt") == "live subaco"
 
-        # 隔離レベルは get_info の metadata が正典（podman = shared-kernel）。
+        # 隔離レベルは get_info の metadata が正典（選択ドライバの宣言値と一致）。
         info = sbx.get_info()
-        assert info.metadata["isolation_level"] == "shared-kernel"
+        assert info.metadata["isolation_level"] == _expected_isolation()
         assert info.metadata["purpose"] == "live-wire"
     finally:
         assert sbx.kill() is True
 
 
-def test_sandbox_run_structured_output_on_real_podman(podman_shim):
+def test_sandbox_run_structured_output_on_real_backend(live_shim):
     """M2a DoD: sandbox_run.py が実行結果と隔離レベルを構造化出力として返すこと。"""
     script = Path(__file__).resolve().parent.parent / "scripts" / "sandbox_run.py"
     spec = importlib.util.spec_from_file_location("sandbox_run_live_wire", script)
@@ -119,7 +139,7 @@ def test_sandbox_run_structured_output_on_real_podman(podman_shim):
     result = mod.run_untrusted("print(21 * 2)", template_id=TEMPLATE)
     assert result["ok"] is True, result
     assert result["text"] is not None and result["text"].strip() == "42"
-    assert result["isolation_level"] == "shared-kernel"
+    assert result["isolation_level"] == _expected_isolation()
     assert result["template_id"] == TEMPLATE
     # hive_remember にそのまま渡せる JSON 化可能な構造化出力。
     json.dumps(result)

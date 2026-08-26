@@ -90,15 +90,15 @@ def run_container_argv(container: str, network: str, image: str) -> list[str]:
     ]
 
 
-def exec_code_argv(container: str, code: str) -> list[str]:
-    """コンテナ内でコードを実行する argv（stdin 監視ウォッチドッグ付き）。
+def code_watchdog_wrapper(code: str) -> str:
+    """payload を stdin 監視ウォッチドッグ付き sh ラッパーで包んだスクリプトを返す。
 
     **切断キャンセルの実測（nightly）で確定した実バグへの対処**: ``podman exec`` の
     クライアントプロセスを kill しても、コンテナ内の exec セッションのプロセスは
     **生き残る**（/tmp/beat ハートビートが cancel 後も更新され続けることを実測）。
     そこで payload を sh ラッパーで包み、**exec セッションの stdin の EOF** を
     ウォッチドッグ（``cat`` + ``kill``）で監視する。クライアント消滅（キャンセル・
-    シム異常死・タイムアウト kill のいずれでも）で podman が stdin ストリームを
+    シム異常死・タイムアウト kill のいずれでも）でバックエンド CLI が stdin ストリームを
     閉じる → ``cat`` が EOF で戻る → payload を kill、という fail-safe 経路になる。
     呼び出し側（exec_start）は stdin をパイプで保持し、キャンセル時に閉じる。
 
@@ -109,14 +109,21 @@ def exec_code_argv(container: str, code: str) -> list[str]:
     暗黙に /dev/null へ差し替えるため、素朴に ``( cat; kill ) &`` と書くと cat が
     即 EOF になり payload を即殺する（nightly 実測で 'Killed' として顕在化）。
     実 stdin を ``exec 3<&0`` で複製し、ウォッチドッグは fd 3 から読む。
+
+    ラッパーは POSIX sh の意味論のみに依存するためバックエンド CLI 非依存で、
+    Apple Container ドライバ（:mod:`._commands_apple`）もここを唯一の情報源とする。
     """
-    watchdog = (
+    return (
         "exec 3<&0\n"
         f"python3 -c {shlex.quote(code)} </dev/null 3<&- & pid=$!\n"
         '( cat <&3 >/dev/null 2>&1; kill -9 "$pid" 2>/dev/null ) &\n'
         'wait "$pid"'
     )
-    return ["exec", "-i", container, "sh", "-c", watchdog]
+
+
+def exec_code_argv(container: str, code: str) -> list[str]:
+    """コンテナ内でコードを実行する argv（stdin 監視ウォッチドッグ付き——上記参照）。"""
+    return ["exec", "-i", container, "sh", "-c", code_watchdog_wrapper(code)]
 
 
 def put_file_argv(container: str, path: str) -> list[str]:

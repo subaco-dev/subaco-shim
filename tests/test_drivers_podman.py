@@ -378,7 +378,7 @@ def test_exec_line_splitting_is_bounded(tmp_path):
     binary = _fake_podman(tmp_path, "yes abcd | head -c 2097152")
     d = PodmanDriver(binary=binary, exec_timeout=30.0, exec_max_output=1024 * 1024)
     execution = d.exec("sbx1", "code")
-    from subaco_shim.drivers.podman import _MAX_OUTPUT_LINES
+    from subaco_shim.drivers._exec import _MAX_OUTPUT_LINES
 
     # 行イベント数は上限 + 集約された残り 1 要素以内。
     assert len(execution.logs.stdout) <= _MAX_OUTPUT_LINES + 1
@@ -388,7 +388,7 @@ def test_exec_line_splitting_is_bounded(tmp_path):
 
 
 def test_split_lines_bounded_semantics():
-    from subaco_shim.drivers.podman import _split_lines_bounded
+    from subaco_shim.drivers._exec import _split_lines_bounded
 
     # 上限内は splitlines() 相当（末尾改行で空要素を作らない）。
     assert _split_lines_bounded("a\nb\n", max_lines=10) == ["a", "b"]
@@ -406,7 +406,7 @@ def test_split_lines_bounded_matches_splitlines():
     ["a\\r", "b\\r"] になった。CR/CRLF/VT/FF/FS/GS/RS/NEL/LS/PS を splitlines() と
     同じ境界として扱う。
     """
-    from subaco_shim.drivers.podman import _split_lines_bounded
+    from subaco_shim.drivers._exec import _split_lines_bounded
 
     samples = [
         "a\r\nb\r\n",
@@ -430,7 +430,7 @@ def test_split_lines_bounded_matches_splitlines():
 
 def test_env_limit_values_reject_non_finite_and_fractional(tmp_path, monkeypatch):
     """nan/inf・小数の制限値は受理せず既定値へフォールバックする。"""
-    from subaco_shim.drivers.podman import (
+    from subaco_shim.drivers._exec import (
         _DEFAULT_EXEC_MAX_OUTPUT,
         _DEFAULT_EXEC_TIMEOUT,
         resolve_exec_max_output,
