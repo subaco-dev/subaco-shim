@@ -11,7 +11,8 @@ podman / Apple Container のように「バックエンド CLI をホスト側�
 - **出力上限**（バイト + 行イベント数）: 未信頼コードの出力し続けによるホスト OOM 防止。
 - **ハード上限 timeout**: SDK 側 run_code(timeout) の保険（クライアント消失時）。
 - **プロセスグループ kill と孤児検出**: 親正常終了後の子孫残存を killpg(pgid, 0) で検出し
-  成功扱いにしない（pipe EOF では stdio を切り離した子孫が見えない——実測）。
+  成功扱いにしない（pipe EOF では stdio を切り離した子孫が見えない——実測）。検出時は
+  reap 済み親 PID の再利用でないことをグループメンバー列挙で確かめてから停止する。
 - **stdin パイプの保持と閉鎖**: コンテナ内ウォッチドッグ（:func:`._commands.code_watchdog_wrapper`）
   へ EOF を届ける経路（切断キャンセルのコンテナ内到達）。
 
@@ -104,6 +105,39 @@ def resolve_exec_max_output() -> int | None:
 
 # str.splitlines() が行境界として扱う文字の集合（\r\n は 1 境界として先に照合）。
 _LINE_BOUNDARY = re.compile("\r\n|[\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029]")
+
+
+def _group_members(pgid: int) -> set[int] | None:
+    """プロセスグループ ``pgid`` に属する PID の集合。列挙できなければ None。
+
+    ``ps -A -o pid=,pgid=`` は macOS（BSD ps）/ Linux（procps）双方で同じ意味を持つ
+    （``-e`` は BSD では「環境変数を表示」なので使わない——実機で確認）。孤児検出の
+    誤検出（reap 済み親 PID の再利用）を切り分けるためだけに使うので、呼ばれるのは
+    グループ生存が見えたときのみ＝正常系のコストはゼロ。
+    """
+    try:
+        out = subprocess.run(
+            ["ps", "-A", "-o", "pid=,pgid="],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    members: set[int] = set()
+    for line in out.stdout.splitlines():
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        try:
+            pid, group = int(parts[0]), int(parts[1])
+        except ValueError:
+            continue
+        if group == pgid:
+            members.add(pid)
+    return members
 
 
 def _split_lines_bounded(text: str, max_lines: int = _MAX_OUTPUT_LINES) -> list[str]:
@@ -224,8 +258,9 @@ class CliExecutionHandle(ExecutionHandle):
         """プロセスグループに生存メンバーがいるか（``killpg(pgid, 0)`` の存在確認）。
 
         exec_start は ``start_new_session=True`` で起動するため pgid == 親 pid。親は
-        wait() で reap 済みなので、ここで見えるのは親が残した子孫だけ。ProcessLookupError
-        以外（PermissionError 等）は「存在するが送れない」なので生存扱い（保守側）。
+        wait() で reap 済みなので、ここで見えるのは親が残した子孫——**または親 PID の
+        再利用先**（:meth:`_orphans_confirmed` 参照）。ProcessLookupError 以外
+        （PermissionError 等）は「存在するが送れない」なので生存扱い（保守側）。
         """
         try:
             os.killpg(self._proc.pid, 0)
@@ -234,6 +269,26 @@ class CliExecutionHandle(ExecutionHandle):
         except OSError:
             return True
         return True
+
+    def _orphans_confirmed(self) -> bool:
+        """グループ生存が **自分の子孫による** ものだと確定できるか。
+
+        親は wait() で reap 済みなので、その PID は OS が別プロセスへ再利用しうる。
+        再利用先がプロセスグループリーダー（別サンドボックスの exec も
+        ``start_new_session=True`` なので pgid == 自 pid になる）だと
+        ``killpg(pgid, 0)`` はそれを拾ってしまい、(1) 正常終了した実行を
+        OrphanedProcesses と誤判定し、(2) **無関係なグループへ SIGKILL を撃つ**
+        （別サンドボックスの実行を巻き込む）。グループのメンバーを列挙し、再利用
+        されたその PID 自身を除いてなお残るものがあるときだけ子孫残存と確定する。
+
+        列挙できない場合（``ps`` が無い等）は **残存を見逃さない側**（True）へ倒す
+        ——孤児検出は未信頼コードの走らせっぱなしを防ぐ安全機構であり、取りこぼしの
+        ほうが誤検出より重い。
+        """
+        members = _group_members(self._proc.pid)
+        if members is None:
+            return True
+        return bool(members - {self._proc.pid})
 
     def _kill_group_and_wait(self, timeout: float) -> bool:
         """グループを SIGKILL し、全メンバーの消滅（PID 消失）まで待つ。消えれば True。"""
@@ -267,7 +322,7 @@ class CliExecutionHandle(ExecutionHandle):
         # なのでグループごと停止し（PID 消滅まで確認）、**成功扱いにしない**
         # （result は OrphanedProcesses エラー）。子孫が無ければ killpg(0) が即
         # ProcessLookupError になるだけで、正常系のコストはゼロ。
-        if self._group_alive():
+        if self._group_alive() and self._orphans_confirmed():
             self._orphaned = True
             _log.warning("exec_orphaned_processes pid=%s — killing process group", self._proc.pid)
             if not self._kill_group_and_wait(timeout=5.0):

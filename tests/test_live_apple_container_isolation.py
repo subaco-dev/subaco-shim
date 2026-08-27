@@ -23,6 +23,7 @@ GitHub ホストの macOS ランナーはネスト仮想化が使えないため
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import re
@@ -85,23 +86,66 @@ def _inspect_addresses(sandbox_id: str, pattern: re.Pattern[str]) -> list[str]:
     return addrs
 
 
-def _container_ip(sandbox_id: str) -> str:
-    """サンドボックスコンテナの（自ネットワーク上の）IPv4 を container inspect で得る。"""
-    addrs = _inspect_addresses(sandbox_id, _IPV4)
-    # 自明な非対象（未割当・ループバック・ブロードキャスト系）を除く。
-    addrs = [a for a in addrs if not a.startswith(("0.", "127.", "255."))]
-    assert addrs, f"コンテナ IPv4 を inspect から抽出できない: {sandbox_id}"
-    return addrs[0]
+def _container_ipv4_candidates(sandbox_id: str) -> list[str]:
+    """コンテナの IPv4 候補を container inspect から集める（自明な非対象を除く）。
 
-
-def _container_ipv6(sandbox_id: str) -> str:
-    """サンドボックスコンテナの ULA IPv6 を container inspect で得る。
-
-    実測: 各ネットワークはネットワークごとに**別の**ランダム ULA /64 prefix を持ち、
-    コンテナへ ULA アドレスが 1 つ付与される（fe80:: link-local とは別）。
+    キー位置非依存の再帰抽出（_find_addresses）の代償として、**サブネット表記のベース
+    アドレス**（``192.168.64.0/24`` → ``192.168.64.0``）のような「誰にも割り当たっていない
+    値」も候補に混じり、抽出順は inspect の JSON 構造に依存する。どれが本物かはホスト側
+    からは決められないので候補のまま返し、_pick_self_reachable でコンテナ自身の到達性に
+    より確定する（実在しないアドレスを本測定に使うと、A からの接続は当然失敗して
+    **分離を証明しないまま green になる**——空振り）。
     """
-    addrs = _inspect_addresses(sandbox_id, _IPV6_ULA)
-    assert addrs, f"コンテナ ULA IPv6 を inspect から抽出できない: {sandbox_id}"
+    addrs = _inspect_addresses(sandbox_id, _IPV4)
+    return [a for a in addrs if not a.startswith(("0.", "127.", "255."))]
+
+
+def _pick_self_reachable(driver, sandbox_id: str, candidates: list[str], port: int) -> str:
+    """候補のうち **そのコンテナ自身から到達できる** アドレスを本測定用に選ぶ。
+
+    「A → B が遮断されている」という測定は、B が実際に listen しているアドレスを叩いて
+    初めて意味を持つ。ここで CONNECTED を確認したアドレスだけを A 側へ渡すことで、
+    抽出ミスによる空振り green を原理的に排除する（本関数自体が positive control）。
+    """
+    assert candidates, f"IPv4 候補を inspect から抽出できない: {sandbox_id}"
+    tried: list[str] = []
+    for addr in candidates:
+        ex = driver.exec(sandbox_id, _probe_code(addr, port))
+        tried.append(f"{addr}={ex.text!r}")
+        if ex.text is not None and ex.text.startswith("CONNECTED"):
+            return addr
+    raise AssertionError(
+        f"B 自身から到達できる自ネットワーク上の IPv4 が候補に無い（B:{port} の実在確認に失敗）: "
+        f"{tried}"
+    )
+
+
+def _is_prefix_base(addr: str) -> bool:
+    """/64 のベースアドレス（ホスト部が全ゼロ = 実在しない値）か。"""
+    try:
+        return int(ipaddress.IPv6Address(addr)) & ((1 << 64) - 1) == 0
+    except ValueError:
+        return True
+
+
+def _container_ipv6(driver, sandbox_id: str, wait_s: float = 10.0) -> str:
+    """コンテナの ULA IPv6 を得る。**コンテナ内で実際に付与された値**を優先する。
+
+    実測: 各ネットワークは**別の**ランダム ULA /64 prefix を持ち、コンテナへ ULA が
+    1 つ付与される（fe80:: link-local とは別）。ただし SLAAC（RA 受信）依存のため
+    2 枚目以降のネットワークでは付与が数分遅れることがあり、その間 inspect は
+    ホスト側割当値を返す。A → B の遮断は A 側ルーティング表の性質（自 /64 以外への
+    経路なし）なので B の SLAAC 状態に依存せず測れる——ので、コンテナ内で取れた実値を
+    優先しつつ、取れなければ inspect 値へフォールバックする。フォールバック時は
+    **prefix のベースアドレスを除外**する（再帰抽出はこれも拾いうる。実在しない値を
+    叩けば分離を証明しないまま green になる）。
+    """
+    ex = driver.exec(sandbox_id, _V6_ULA_SELF_CODE.format(wait=wait_s))
+    inside = (ex.text or "").strip()
+    if inside:
+        return inside
+    addrs = [a for a in _inspect_addresses(sandbox_id, _IPV6_ULA) if not _is_prefix_base(a)]
+    assert addrs, f"コンテナ ULA IPv6 を取得できない（コンテナ内・inspect とも）: {sandbox_id}"
     return addrs[0]
 
 
@@ -181,15 +225,17 @@ deadline = time.monotonic() + 30
 result = "NO-LINKLOCAL"
 while time.monotonic() < deadline:
     ll = None
+    dev = None
     for line in open("/proc/net/if_inet6"):
         parts = line.split()
         if parts[-1] != "lo" and parts[0].startswith("fe80"):
             raw = parts[0]
+            dev = parts[-1]
             ll = ":".join(raw[i:i + 4] for i in range(0, 32, 4))
             break
     if ll is not None:
         try:
-            s = socket.create_connection((ll + "%eth0", 49999), timeout=5)
+            s = socket.create_connection((ll + "%" + dev, 49999), timeout=5)
             s.close()
             result = "CONNECTED"
             break
@@ -198,6 +244,25 @@ while time.monotonic() < deadline:
     time.sleep(1.0)
 print(result)
 """
+
+# コンテナ内で実際に付与された ULA を読む（inspect のホスト側割当値より確度が高い）。
+# SLAAC（RA 受信）待ちなので取れないこともある——その場合は inspect へフォールバックする。
+_V6_ULA_SELF_CODE = """
+import time
+deadline = time.monotonic() + {wait}
+found = ""
+while not found and time.monotonic() < deadline:
+    for line in open("/proc/net/if_inet6"):
+        parts = line.split()
+        raw = parts[0]
+        if parts[-1] != "lo" and raw[:2].lower() in ("fc", "fd"):
+            found = ":".join(raw[i:i + 4] for i in range(0, 32, 4))
+            break
+    if not found:
+        time.sleep(0.5)
+print(found)
+"""
+
 
 # キャンセル実測用ハートビート（0.2 秒間隔で /tmp/beat を更新し続ける）。
 _HEARTBEAT_CODE = """
@@ -265,7 +330,12 @@ def test_sandbox_to_sandbox_ports_blocked(driver):
             )
 
         # 本測定: A から B のネットワーク上 IP へは両ポートとも到達できない。
-        b_ip = _container_ip(b.sandbox_id)
+        # 使う IP は「B 自身から到達できる」ことを確認したものに限る（inspect の再帰抽出は
+        # サブネットのベースアドレスも拾いうる。実在しない IP を叩くと A 側は当然失敗し、
+        # 分離を証明しないまま green になる）。
+        b_ip = _pick_self_reachable(
+            driver, b.sandbox_id, _container_ipv4_candidates(b.sandbox_id), 49999
+        )
         for port in (49983, 49999):
             ex = driver.exec(a.sandbox_id, _probe_code(b_ip, port))
             assert ex.error is None, f"プローブ自体が失敗: {ex.error}"
@@ -306,7 +376,7 @@ def test_sandbox_to_sandbox_ipv6_blocked(driver):
     try:
         listener = driver.exec_start(b.sandbox_id, _LISTENER_V6_CODE)
         _wait_for_file(driver, b.sandbox_id, "/tmp/listener6-ready")
-        b_ip6 = _container_ipv6(b.sandbox_id)
+        b_ip6 = _container_ipv6(driver, b.sandbox_id)
 
         # positive control: B 自身から自分の link-local へ（v6 スタック + リスナー実在の証明）。
         ex = driver.exec(b.sandbox_id, _V6_SELF_PROBE)

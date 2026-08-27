@@ -368,6 +368,57 @@ def test_exec_orphaned_devnull_children_detected_and_killed(tmp_path):
         pytest.fail(f"orphaned child pid={pid} still alive")
 
 
+def test_group_members_lists_own_process_group():
+    """_group_members が自プロセスのグループを列挙できる（ps 依存部の実測）。"""
+    import os
+
+    from subaco_shim.drivers._exec import _group_members
+
+    members = _group_members(os.getpgrp())
+    assert members is not None, "ps によるプロセスグループ列挙が使えない"
+    assert os.getpid() in members
+
+
+def test_exec_recycled_parent_pid_is_not_reported_as_orphan(tmp_path, monkeypatch):
+    """reap 済み親 PID の**再利用**を孤児と誤判定しない（無関係グループを殺さない）。
+
+    レビュー指摘の再現: 親は wait() で reap 済みなので、その PID は OS が回して別
+    プロセスへ割り当てうる。再利用先がプロセスグループリーダー（別サンドボックスの
+    exec も start_new_session=True なので pgid == 自 pid になる）だと killpg(pgid, 0)
+    が成功し、正常終了した実行が OrphanedProcesses になったうえ、**無関係なグループへ
+    SIGKILL が飛ぶ**。グループのメンバーが「その PID 自身だけ」なら子孫は残っていないと
+    確定できる。
+    """
+    from subaco_shim.drivers import _exec
+
+    killed: list[int] = []
+    # killpg(pgid, 0) が成功する状況（＝子孫残存または PID 再利用）を固定し、
+    # グループの中身は「再利用された親 PID 自身のみ」= 子孫なしにする。
+    monkeypatch.setattr(_exec.CliExecutionHandle, "_group_alive", lambda self: True)
+    monkeypatch.setattr(_exec, "_group_members", lambda pgid: {pgid})
+    monkeypatch.setattr(
+        _exec.CliExecutionHandle, "_kill_group", lambda self: killed.append(self._proc.pid)
+    )
+
+    binary = _fake_podman(tmp_path, "echo done")
+    d = PodmanDriver(binary=binary, exec_timeout=60.0)
+    execution = d.exec("sbx1", "code")
+    assert execution.error is None, f"PID 再利用を孤児と誤判定した: {execution.error}"
+    assert execution.text == "done\n"
+    assert killed == [], "無関係なプロセスグループへ kill を撃ってはならない"
+
+
+def test_exec_orphan_detection_falls_back_when_ps_unavailable(tmp_path, monkeypatch):
+    """グループ列挙ができないときは **残存を見逃さない側**（従来どおり孤児扱い）へ倒す。"""
+    from subaco_shim.drivers import _exec
+
+    monkeypatch.setattr(_exec, "_group_members", lambda pgid: None)
+    binary = _fake_podman(tmp_path, "sleep 30 &\nexit 0")
+    d = PodmanDriver(binary=binary, exec_timeout=60.0)
+    execution = d.exec("sbx1", "code")
+    assert execution.error is not None and execution.error.name == "OrphanedProcesses"
+
+
 def test_exec_line_splitting_is_bounded(tmp_path):
     """バイト上限通過後の行分割にも上限がある（短い行の大量分割による再膨張の防止）。
 
