@@ -5,6 +5,7 @@
 #   ubuntu + macos マトリクスで実行する。実行時依存は certifi のみ（uv run が解決）。
 # - podman の実コンテナ統合は **nightly**（schedule）で ubuntu のみ実行する。実バイナリ検出に
 #   依存するテストは `shutil.which("podman")` ガードで skip されるため、通常の PR/push では走らない。
+# - setup-uv は v8 以降メジャータグ（@vN）を提供しないため、上流 README の作法どおり commit SHA（# vX.Y.Z 併記）でピン留めする。
 name: CI
 
 on:
@@ -25,9 +26,9 @@ jobs:
     name: lint (ruff)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: uv をセットアップ（Python 3.11）
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           python-version: "3.11"
       - name: ruff check
@@ -44,9 +45,9 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: uv をセットアップ（Python 3.11）
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           python-version: "3.11"
       - name: pytest（mock ドライバ。実行時依存 certifi は uv run が解決）
@@ -64,9 +65,9 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: uv をセットアップ（Python 3.11）
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           python-version: "3.11"
       - name: 依存を同期（e2b SDK 固定版を含む test extra）
@@ -81,7 +82,7 @@ jobs:
     needs: lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: podman を確保（ランナー同梱を優先・不在時のみ apt）
         # ランナー同梱の podman（/usr/local/bin・5.x）があれば apt を打たない:
         # apt の 4.9 系を併存させると「pull した個体と別バージョンが同一ストレージを
@@ -106,7 +107,7 @@ jobs:
           apt_get install -y podman
           podman --version
       - name: uv をセットアップ（Python 3.11）
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           python-version: "3.11"
       - name: サンドボックスイメージを事前 pull（create 時 120s タイムアウトから pull を分離）
